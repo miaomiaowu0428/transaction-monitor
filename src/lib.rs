@@ -65,6 +65,9 @@ pub async fn tx_monitor_task() {
             Ok(msg) => match msg.update_oneof {
                 Some(UpdateOneof::Transaction(sut)) => {
                     let tx: TransactionFormat = sut.into();
+                    if tx.account_keys.contains(&Pubkey::default()) {
+                        panic!("found tx: {}", tx.signature)
+                    }
                 }
                 Some(UpdateOneof::Ping(_)) => {
                     let _ = subscribe_tx
