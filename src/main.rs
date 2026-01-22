@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use transaction_monitor::{tx_dispatcher::TxDispatcher, tx_subscriber::SubscriberDemo};
 
+/// this main is only for testing; should not be used in production
 #[tokio::main]
 async fn main() {
     rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
