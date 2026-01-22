@@ -79,7 +79,8 @@ impl TxDispatcher {
             .subscribe_with_request(Some(subscribe_request))
             .await
             .expect("subscribe_with_request failed");
-
+        
+        info!("subscribe_with_request succeeded");
         while let Some(message) = stream.next().await {
             match message {
                 Ok(msg) => match msg.update_oneof {
