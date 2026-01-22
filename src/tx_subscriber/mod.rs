@@ -37,7 +37,14 @@ impl TxSubscriber for SubscriberDemo {
         let watch_set = self.watch.load(); // Arc<HashSet<_>>
 
         // 是否已有关注账户
-        let res = tx.account_keys.iter().any(|k| watch_set.contains(k));
+        let res = tx.account_keys.iter().any(|k| {
+            if watch_set.contains(k) {
+                info!("Account {} is already in watchlist", k);
+                true
+            } else {
+                false
+            }
+        });
 
         // 随机添加一个账户到 watchlist
         if let Some(random_account) = tx.account_keys.choose(&mut rand::rng()) {
