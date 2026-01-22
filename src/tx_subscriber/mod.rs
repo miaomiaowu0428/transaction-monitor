@@ -34,7 +34,7 @@ impl TxSubscriber for SubscriberDemo {
 
     fn interested(&self, tx: &TransactionFormat) -> bool {
         let set = self.watch.load();
-        tx.account_keys.iter().any(|k| set.contains(k))
+        tx.account_keys.iter().any(|k| set.contains(k)) || true
     }
 
     fn on_tx(&self, tx: Arc<TransactionFormat>) {
