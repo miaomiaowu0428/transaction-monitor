@@ -26,3 +26,5 @@ utils = { git = "https://github.com/miaomiaowu0428/sol-utils.git"  }
 rustls = "0.23.36"
 chrono = "0.4.43"
 yellowstone-grpc-proto = "10.1.1"
+async-trait = "0.1.89"
+arc-swap = "1.8.0"
