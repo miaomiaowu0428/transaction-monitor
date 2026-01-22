@@ -13,6 +13,7 @@ pub trait TxSubscriber: Send + Sync + 'static {
 
 use arc_swap::ArcSwap;
 use log::info;
+use rand::seq::IndexedRandom;
 use solana_sdk::pubkey::Pubkey;
 use std::{collections::HashSet, sync::Arc};
 
@@ -29,16 +30,37 @@ impl SubscriberDemo {
 
 impl TxSubscriber for SubscriberDemo {
     fn name(&self) -> &'static str {
-        "spam_detector"
+        "subscriber demo"
     }
 
     fn interested(&self, tx: &TransactionFormat) -> bool {
-        let set = self.watch.load();
-        tx.account_keys.iter().any(|k| set.contains(k)) || true
+        let watch_set = self.watch.load(); // Arc<HashSet<_>>
+
+        // 是否已有关注账户
+        let res = tx.account_keys.iter().any(|k| watch_set.contains(k));
+
+        // 随机添加一个账户到 watchlist
+        if let Some(random_account) = tx.account_keys.choose(&mut rand::rng()) {
+            // 克隆当前 HashSet
+            let mut new_set = (**watch_set).clone();
+            new_set.insert(*random_account);
+
+            // 存回 ArcSwap
+            self.watch.store(Arc::new(new_set));
+
+            info!(
+                "[{}] Added account {} to watchlist",
+                self.name(),
+                random_account
+            );
+        }
+
+        res
     }
 
-    fn on_tx(&self, tx: Arc<TransactionFormat>) {
-        info!("Received transaction: {:?}", tx);
-        panic!("Not implemented")
+    fn on_tx(&self, _tx: Arc<TransactionFormat>) {
+        // 这里可以做处理或者直接 spawn tokio 任务异步处理
+        info!("[{}] Received tx: {}", self.name(), _tx.signature);
+        panic!("should panic");
     }
 }

@@ -33,10 +33,10 @@ impl TxDispatcher {
     }
     pub fn register(&self, sub: Arc<dyn TxSubscriber>) -> &Self {
         // 克隆当前 Vec
-        let new = self.subscribers.load_full(); // load_full() 会返回 Arc<Vec<_>>
-        let mut new_vec = (*new).clone(); // 先克隆 Vec
-        new_vec.push(sub); // 现在可以 mut
-        self.subscribers.store(Arc::new(new_vec)); // 存回 ArcSwap
+        let old = self.subscribers.load(); // load_full() 会返回 Arc<Vec<_>>
+        let mut new = (**old).clone(); // 先克隆 Vec
+        new.push(sub); // 现在可以 mut
+        self.subscribers.store(Arc::new(new)); // 存回 ArcSwap
         self
     }
 }
@@ -79,7 +79,7 @@ impl TxDispatcher {
             .subscribe_with_request(Some(subscribe_request))
             .await
             .expect("subscribe_with_request failed");
-        
+
         while let Some(message) = stream.next().await {
             match message {
                 Ok(msg) => match msg.update_oneof {

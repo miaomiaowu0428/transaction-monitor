@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
-use transaction_monitor::{
-    monitor_task::tx_monitor_task, tx_dispatcher::TxDispatcher, tx_subscriber::SubscriberDemo,
-};
+use transaction_monitor::{tx_dispatcher::TxDispatcher, tx_subscriber::SubscriberDemo};
 
 #[tokio::main]
 async fn main() {
