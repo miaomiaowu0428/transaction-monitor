@@ -1,41 +1,13 @@
-
-
-
-#[cfg(feature = "shred")]
-use crate::abc_manipulator::analyze_abc_pattern;
-#[cfg(feature = "shred")]
-use crate::shred::{
-    commondef, commondef::ShredTxTemplate, lookuptable_handler::LookupTableMgr,
-    shred_mgr::ShredClientMgr, shred_tx_parse, solana::SolanaWrapper,
-};
 use futures::{SinkExt, StreamExt};
 use grpc_client::TransactionFormat;
 use grpc_client::YellowstoneGrpc;
-use log::error;
 use log::info;
-use solana_sdk::signature::Signature;
-use solana_sdk::transaction::VersionedTransaction;
-use solana_sdk::{pubkey, pubkey::Pubkey};
+use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
-use std::collections::HashSet;
-use std::collections::VecDeque;
-
-use std::sync::LazyLock;
-use std::time::Instant;
-use tokio::sync::RwLock;
-#[cfg(feature = "shred")]
-use tokio::task::JoinHandle;
-use utils::IndexedInstruction;
-use utils::SolToLamport;
-use utils::flatten_instructions;
-use utils::flatten_main_instructions;
-use whirlwind::ShardMap;
 use yellowstone_grpc_proto::geyser::{
     CommitmentLevel, SubscribeRequest, SubscribeRequestFilterTransactions, SubscribeRequestPing,
     subscribe_update::UpdateOneof,
 };
-
-
 
 pub async fn tx_monitor_task() {
     let url = std::env::var("YELLOWSTONE_GRPC_URL").expect("YELLOWSTONE_GRPC_URL must be set");

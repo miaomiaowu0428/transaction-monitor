@@ -1,4 +1,8 @@
-use transaction_monitor::monitor_task::tx_monitor_task;
+use std::sync::Arc;
+
+use transaction_monitor::{
+    monitor_task::tx_monitor_task, tx_dispatcher::TxDispatcher, tx_subscriber::SubscriberDemo,
+};
 
 #[tokio::main]
 async fn main() {
@@ -6,5 +10,8 @@ async fn main() {
         .unwrap();
     dotenvy::dotenv().ok();
     utils::init_logger();
-    tx_monitor_task().await;
+    TxDispatcher::new()
+        .register(Arc::new(SubscriberDemo::new()))
+        .run()
+        .await;
 }

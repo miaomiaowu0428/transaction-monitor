@@ -19,6 +19,13 @@ use std::{collections::HashSet, sync::Arc};
 pub struct SubscriberDemo {
     watch: ArcSwap<HashSet<Pubkey>>,
 }
+impl SubscriberDemo {
+    pub fn new() -> Self {
+        Self {
+            watch: ArcSwap::new(Arc::new(HashSet::new())),
+        }
+    }
+}
 
 impl TxSubscriber for SubscriberDemo {
     fn name(&self) -> &'static str {
@@ -32,5 +39,6 @@ impl TxSubscriber for SubscriberDemo {
 
     fn on_tx(&self, tx: Arc<TransactionFormat>) {
         info!("Received transaction: {:?}", tx);
+        panic!("Not implemented")
     }
 }
