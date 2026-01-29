@@ -114,7 +114,10 @@ impl TxDispatcher {
 
     async fn run_once(&self, url: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let grpc = YellowstoneGrpc::new(url.to_string(), None);
-        let client = grpc.build_client().await?;
+        let client = grpc
+            .build_client()
+            .await
+            .map_err(|e| format!("Failed to build gRPC client: {:?}", e))?;
 
         // 获取账户过滤器
         let account_filters = self.account_filters.load();
