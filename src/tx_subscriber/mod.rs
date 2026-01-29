@@ -1,5 +1,9 @@
 use grpc_client::TransactionFormat;
 
+pub mod scatter_gather;
+pub mod trace_integration;
+pub mod utils;
+
 pub trait TxSubscriber: Send + Sync + 'static {
     /// 模块名字，仅用于日志
     fn name(&self) -> &'static str;
