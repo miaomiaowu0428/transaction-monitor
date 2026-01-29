@@ -87,13 +87,21 @@ impl TxDispatcher {
 
     pub async fn run(&self) {
         let url = std::env::var("YELLOWSTONE_GRPC_URL").expect("YELLOWSTONE_GRPC_URL must be set");
+        let token = std::env::var("YELLOWSTONE_GRPC_TOKEN").ok();
+
+        if let Some(ref t) = token {
+            info!("✅ 使用 Yellowstone token 认证");
+        } else {
+            warn!("⚠️ 未设置 YELLOWSTONE_GRPC_TOKEN，可能需要 token 才能连接");
+        }
+
         let mut reconnect_delay = tokio::time::Duration::from_secs(1);
         let max_reconnect_delay = tokio::time::Duration::from_secs(60);
 
         loop {
             info!("🔗 正在连接到 Yellowstone gRPC: {}", url);
 
-            match self.run_once(&url).await {
+            match self.run_once(&url, token.as_deref()).await {
                 Ok(_) => {
                     warn!("⚠️ gRPC 流正常结束，准备重连...");
                     reconnect_delay = tokio::time::Duration::from_secs(1);
@@ -112,8 +120,12 @@ impl TxDispatcher {
         }
     }
 
-    async fn run_once(&self, url: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let grpc = YellowstoneGrpc::new(url.to_string(), None);
+    async fn run_once(
+        &self,
+        url: &str,
+        token: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let grpc = YellowstoneGrpc::new(url.to_string(), token.map(|s| s.to_string()));
         let client = grpc
             .build_client()
             .await
