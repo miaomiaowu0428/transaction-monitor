@@ -92,7 +92,7 @@ impl TxDispatcher {
         if let Some(ref t) = token {
             info!("✅ 使用 Yellowstone token 认证");
         } else {
-            warn!("⚠️ 未设置 YELLOWSTONE_GRPC_TOKEN，可能需要 token 才能连接");
+            warn!("⚠️ 未设置 YELLOWSTONE_GRPC_TOKEN，请确保您使用的节点无需认证");
         }
 
         let mut reconnect_delay = tokio::time::Duration::from_secs(1);
