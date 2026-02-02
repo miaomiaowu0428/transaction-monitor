@@ -10,9 +10,9 @@ futures = "0.3.31"
 log = "0.4.29"
 serde = "1.0.228"
 serde_json = "1.0.149"
-solana-client = "3.1.7"
+solana-client = "3.1.8"
 solana-sdk = "3.0.0"
-solana-transaction-status-client-types = "3.1.7"
+solana-transaction-status-client-types = "3.1.8"
 solana-tx-parser = { git = "https://github.com/miaomiaowu0428/solana-tx-parser.git" }
 tokio = "1.49.0"
 grpc-client = { git = "https://github.com/miaomiaowu0428/grpc-client.git" }
