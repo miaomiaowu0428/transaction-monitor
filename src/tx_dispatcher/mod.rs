@@ -80,7 +80,7 @@ impl TxDispatcher {
 
         for sub in subs.iter() {
             if sub.interested(&tx) {
-                sub.on_tx(tx.clone());
+                sub.clone().on_tx(tx.clone());
             }
         }
     }

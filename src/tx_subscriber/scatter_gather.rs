@@ -499,7 +499,7 @@ impl TxSubscriber for ScatterGatherSubscriber {
         tx.account_keys.iter().any(|k| watch_set.contains(k))
     }
 
-    fn on_tx(&self, tx: Arc<TransactionFormat>) {
+    fn on_tx(self: Arc<Self>, tx: Arc<TransactionFormat>) {
         // Extract SOL transfers
         let transfers = self.extract_sol_transfers(&tx);
 

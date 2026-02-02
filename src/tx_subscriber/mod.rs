@@ -12,7 +12,7 @@ pub trait TxSubscriber: Send + Sync + 'static {
     fn interested(&self, tx: &TransactionFormat) -> bool;
 
     /// 真正的处理逻辑
-    fn on_tx(&self, tx: Arc<TransactionFormat>);
+    fn on_tx(self: Arc<Self>, tx: Arc<TransactionFormat>);
 }
 
 use arc_swap::ArcSwap;
@@ -69,7 +69,7 @@ impl TxSubscriber for SubscriberDemo {
         res
     }
 
-    fn on_tx(&self, _tx: Arc<TransactionFormat>) {
+    fn on_tx(self: Arc<Self>, _tx: Arc<TransactionFormat>) {
         // 这里可以做处理或者直接 spawn tokio 任务异步处理
         info!("[{}] Received tx: {}", self.name(), _tx.signature);
         panic!("should panic");
