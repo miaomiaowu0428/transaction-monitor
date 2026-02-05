@@ -487,19 +487,21 @@ impl ScatterGatherSubscriber {
     }
 }
 
+
+#[async_trait::async_trait]
 impl TxSubscriber for ScatterGatherSubscriber {
     fn name(&self) -> &'static str {
         "scatter-gather-monitor"
     }
 
-    fn interested(&self, tx: &TransactionFormat) -> bool {
+    async fn interested(&self, tx: &TransactionFormat) -> bool {
         let watch_set = self.watch_set.load();
 
         // Fast path: check if any account_key is in our watch set
         tx.account_keys.iter().any(|k| watch_set.contains(k))
     }
 
-    fn on_tx(self: Arc<Self>, tx: Arc<TransactionFormat>) {
+    async fn on_tx(self: Arc<Self>, tx: Arc<TransactionFormat>) {
         // Extract SOL transfers
         let transfers = self.extract_sol_transfers(&tx);
 

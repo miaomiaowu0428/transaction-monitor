@@ -75,12 +75,12 @@ impl TxDispatcher {
 }
 
 impl TxDispatcher {
-    pub fn dispatch(&self, tx: Arc<TransactionFormat>) {
+    pub async fn dispatch(&self, tx: Arc<TransactionFormat>) {
         let subs = self.subscribers.load();
 
         for sub in subs.iter() {
-            if sub.interested(&tx) {
-                sub.clone().on_tx(tx.clone());
+            if sub.interested(&tx).await {
+                sub.clone().on_tx(tx.clone()).await;
             }
         }
     }
