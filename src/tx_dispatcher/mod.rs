@@ -96,7 +96,7 @@ impl TxDispatcher {
         let token = std::env::var("YELLOWSTONE_GRPC_TOKEN").ok();
 
         if let Some(ref t) = token {
-            info!("✅ 使用 Yellowstone token 认证");
+            info!("✅ 使用 Yellowstone token 认证: {}", &t[..8]);
         } else {
             warn!("⚠️ 未设置 YELLOWSTONE_GRPC_TOKEN，请确保您使用的节点无需认证");
         }
