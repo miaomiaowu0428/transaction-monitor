@@ -173,7 +173,7 @@ impl TxDispatcher {
                 Ok(msg) => match msg.update_oneof {
                     Some(UpdateOneof::Transaction(sut)) => {
                         let tx: TransactionFormat = sut.into();
-                        self.dispatch(Arc::new(tx));
+                        self.dispatch(Arc::new(tx)).await;
                     }
                     Some(UpdateOneof::Ping(_)) => {
                         let _ = subscribe_tx
