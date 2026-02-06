@@ -79,9 +79,15 @@ impl TxDispatcher {
         let subs = self.subscribers.load();
 
         for sub in subs.iter() {
-            if sub.interested(&tx).await {
-                sub.clone().on_tx(tx.clone()).await;
-            }
+            let sub = sub.clone();
+            let tx = tx.clone();
+            
+            // spawn 到独立 task，避免 panic/错误影响其他 subscriber，同时实现并行处理
+            tokio::spawn(async move {
+                if sub.interested(&tx).await {
+                    sub.on_tx(tx).await;
+                }
+            });
         }
     }
 
