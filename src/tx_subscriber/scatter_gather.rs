@@ -494,11 +494,11 @@ impl TxSubscriber for ScatterGatherSubscriber {
         "scatter-gather-monitor"
     }
 
-    async fn interested(&self, tx: &TransactionFormat) -> bool {
+    async fn interested(&self, tx: &TransactionFormat) -> Option<bool> {
         let watch_set = self.watch_set.load();
 
         // Fast path: check if any account_key is in our watch set
-        tx.account_keys.iter().any(|k| watch_set.contains(k))
+        Some(tx.account_keys.iter().any(|k| watch_set.contains(k)))
     }
 
     async fn on_tx(self: Arc<Self>, tx: Arc<TransactionFormat>) {

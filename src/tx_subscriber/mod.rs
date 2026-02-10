@@ -10,7 +10,12 @@ pub trait TxSubscriber: Send + Sync + 'static {
     fn name(&self) -> &'static str;
 
     /// 是否对这笔交易感兴趣（必须非常快）
-    async fn interested(&self, tx: &TransactionFormat) -> bool;
+    /// 
+    /// 返回值：
+    /// - Some(true): 感兴趣，会调用 on_tx
+    /// - Some(false): 不感兴趣，跳过
+    /// - None: 请求注销，dispatcher 会移除此 subscriber
+    async fn interested(&self, tx: &TransactionFormat) -> Option<bool>;
 
     /// 真正的处理逻辑
     async fn on_tx(self: Arc<Self>, tx: Arc<TransactionFormat>);
@@ -39,7 +44,7 @@ impl TxSubscriber for SubscriberDemo {
         "subscriber demo"
     }
 
-    async fn interested(&self, tx: &TransactionFormat) -> bool {
+    async fn interested(&self, tx: &TransactionFormat) -> Option<bool> {
         let watch_set = self.watch.load(); // Arc<HashSet<_>>
 
         // 是否已有关注账户
@@ -68,7 +73,7 @@ impl TxSubscriber for SubscriberDemo {
             );
         }
 
-        res
+        Some(res)
     }
 
     async fn on_tx(self: Arc<Self>, _tx: Arc<TransactionFormat>) {
