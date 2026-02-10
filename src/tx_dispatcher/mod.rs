@@ -54,7 +54,6 @@ impl SubscriberHandle {
 impl Drop for SubscriberHandle {
     fn drop(&mut self) {
         if let Some(dispatcher) = self.dispatcher.upgrade() {
-            info!("🔄 SubscriberHandle dropped [{}] ID: {}，自动取消注册", self.subscriber.name(), self.id);
             dispatcher.unregister_by_id(self.id);
         }
     }
