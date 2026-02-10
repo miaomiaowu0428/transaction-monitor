@@ -207,26 +207,16 @@ impl TxDispatcherInner {
 impl TxDispatcher {
     pub async fn dispatch(&self, tx: Arc<TransactionFormat>) {
         let subs = self.inner.subscribers.load();
-        let mut unregister_ids = Vec::new();
 
-        // 收集所有 interested 结果
-        let mut tasks = Vec::new();
+        // 为每个 subscriber 独立 spawn 任务
         for (id, sub) in subs.iter() {
             let id = *id;
             let sub = sub.clone();
             let tx = tx.clone();
+            let dispatcher = self.inner.clone();
             
-            let task = tokio::spawn(async move {
-                let interested_result = sub.interested(&tx).await;
-                (id, interested_result, sub, tx)
-            });
-            tasks.push(task);
-        }
-
-        // 处理结果并收集注销请求
-        for task in tasks {
-            if let Ok((id, interested_result, sub, tx)) = task.await {
-                match interested_result {
+            tokio::spawn(async move {
+                match sub.interested(&tx).await {
                     Some(true) => {
                         // 感兴趣，spawn on_tx 处理
                         tokio::spawn(async move {
@@ -237,18 +227,11 @@ impl TxDispatcher {
                         // 不感兴趣，跳过
                     }
                     None => {
-                        // 请求注销
-                        unregister_ids.push(id);
+                        // 请求注销，立即执行
+                        dispatcher.unregister_by_id(id);
                     }
                 }
-            }
-        }
-
-        // 批量注销
-        if !unregister_ids.is_empty() {
-            for id in unregister_ids {
-                self.inner.unregister_by_id(id);
-            }
+            });
         }
     }
 
