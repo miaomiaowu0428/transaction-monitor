@@ -1,5 +1,6 @@
 use grpc_client::TransactionFormat;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::{SinkExt, StreamExt};
 
@@ -16,16 +17,81 @@ use crate::tx_subscriber::TxSubscriber;
 
 use arc_swap::ArcSwap;
 
-pub struct TxDispatcher {
-    subscribers: ArcSwap<Vec<Arc<dyn TxSubscriber>>>,
+static SUBSCRIBER_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Subscriber 注册句柄，可用于取消注册
+/// 
+/// 当 Handle 被 drop 时，会自动取消注册对应的 subscriber
+pub struct SubscriberHandle {
+    id: u64,
+    subscriber: Arc<dyn TxSubscriber>,
+    dispatcher: Weak<TxDispatcherInner>,
+}
+
+impl SubscriberHandle {
+    /// 获取 subscriber 的唯一 ID
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// 获取 subscriber 的引用
+    pub fn subscriber(&self) -> &Arc<dyn TxSubscriber> {
+        &self.subscriber
+    }
+
+    /// 手动取消注册（提前释放）
+    /// 
+    /// 返回 true 表示成功取消注册，false 表示已经被取消或 dispatcher 已释放
+    pub fn unregister(self) -> bool {
+        if let Some(dispatcher) = self.dispatcher.upgrade() {
+            dispatcher.unregister_by_id(self.id)
+        } else {
+            false
+        }
+    }
+}
+
+impl Drop for SubscriberHandle {
+    fn drop(&mut self) {
+        if let Some(dispatcher) = self.dispatcher.upgrade() {
+            info!("🔄 SubscriberHandle dropped [{}] ID: {}，自动取消注册", self.subscriber.name(), self.id);
+            dispatcher.unregister_by_id(self.id);
+        }
+    }
+}
+
+impl std::fmt::Debug for SubscriberHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubscriberHandle")
+            .field("id", &self.id)
+            .finish()
+    }
+}
+
+struct TxDispatcherInner {
+    subscribers: ArcSwap<HashMap<u64, Arc<dyn TxSubscriber>>>,
     account_filters: ArcSwap<Option<Vec<String>>>,
+}
+
+pub struct TxDispatcher {
+    inner: Arc<TxDispatcherInner>,
 }
 
 impl Default for TxDispatcher {
     fn default() -> Self {
         Self {
-            subscribers: ArcSwap::from_pointee(Vec::new()),
-            account_filters: ArcSwap::from_pointee(None),
+            inner: Arc::new(TxDispatcherInner {
+                subscribers: ArcSwap::from_pointee(HashMap::new()),
+                account_filters: ArcSwap::from_pointee(None),
+            }),
+        }
+    }
+}
+
+impl Clone for TxDispatcher {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
         }
     }
 }
@@ -49,7 +115,7 @@ impl TxDispatcher {
     /// ```
     pub fn with_account_filters(&self, accounts: Vec<Pubkey>) -> &Self {
         let account_strings: Vec<String> = accounts.iter().map(|pk| pk.to_string()).collect();
-        self.account_filters.store(Arc::new(Some(account_strings)));
+        self.inner.account_filters.store(Arc::new(Some(account_strings)));
         info!(
             "✅ TxDispatcher 账户过滤器已设置，共 {} 个账户",
             accounts.len()
@@ -59,26 +125,91 @@ impl TxDispatcher {
 
     /// 清除账户过滤器，订阅全链交易（如果节点支持）
     pub fn clear_account_filters(&self) -> &Self {
-        self.account_filters.store(Arc::new(None));
+        self.inner.account_filters.store(Arc::new(None));
         info!("🔄 TxDispatcher 账户过滤器已清除，订阅全链交易");
         self
     }
 
+    /// 注册 subscriber（旧接口，保持向后兼容）
+    /// 
+    /// 注意：使用此方法注册的 subscriber 无法取消注册
+    /// 如需取消注册功能，请使用 `register_with_handle` 方法
     pub fn register(&self, sub: Arc<dyn TxSubscriber>) -> &Self {
-        // 克隆当前 Vec
-        let old = self.subscribers.load(); // load_full() 会返回 Arc<Vec<_>>
-        let mut new = (**old).clone(); // 先克隆 Vec
-        new.push(sub); // 现在可以 mut
-        self.subscribers.store(Arc::new(new)); // 存回 ArcSwap
+        let id = SUBSCRIBER_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let old = self.inner.subscribers.load();
+        let mut new = (**old).clone();
+        new.insert(id, sub.clone());
+        let count = new.len();
+        self.inner.subscribers.store(Arc::new(new));
+        
+        info!("✅ Subscriber 已注册 [{}] ID: {}，当前共 {} 个 subscriber", sub.name(), id, count);
+        
         self
+    }
+
+    /// 注册 subscriber 并返回句柄（推荐使用）
+    ///
+    /// 返回的 `SubscriberHandle` 会在 drop 时自动取消注册
+    /// 也可以手动调用 `handle.unregister()` 提前释放
+    ///
+    /// # 示例
+    /// ```rust,ignore
+    /// // 自动管理生命周期
+    /// {
+    ///     let handle = dispatcher.register_with_handle(Arc::new(my_subscriber));
+    ///     // ... 使用
+    /// } // handle drop 时自动取消注册
+    ///
+    /// // 或手动控制
+    /// let handle = dispatcher.register_with_handle(Arc::new(my_subscriber));
+    /// handle.unregister(); // 提前手动取消
+    /// ```
+    pub fn register_with_handle(&self, sub: Arc<dyn TxSubscriber>) -> SubscriberHandle {
+        let id = SUBSCRIBER_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let old = self.inner.subscribers.load();
+        let mut new = (**old).clone();
+        new.insert(id, sub.clone());
+        let count = new.len();
+        self.inner.subscribers.store(Arc::new(new));
+        
+        info!("✅ Subscriber 已注册 [{}] ID: {}，当前共 {} 个 subscriber", sub.name(), id, count);
+        
+        SubscriberHandle {
+            id,
+            subscriber: sub,
+            dispatcher: Arc::downgrade(&self.inner),
+        }
+    }
+
+    /// 获取当前注册的 subscriber 数量
+    pub fn subscriber_count(&self) -> usize {
+        self.inner.subscribers.load().len()
+    }
+}
+
+impl TxDispatcherInner {
+    fn unregister_by_id(&self, id: u64) -> bool {
+        let old = self.subscribers.load();
+        if let Some(sub) = old.get(&id) {
+            let name = sub.name();
+            let mut new = (**old).clone();
+            new.remove(&id);
+            let count = new.len();
+            self.subscribers.store(Arc::new(new));
+            
+            info!("✅ Subscriber 已取消注册 [{}] ID: {}，当前剩余 {} 个 subscriber", name, id, count);
+            true
+        } else {
+            false
+        }
     }
 }
 
 impl TxDispatcher {
     pub async fn dispatch(&self, tx: Arc<TransactionFormat>) {
-        let subs = self.subscribers.load();
+        let subs = self.inner.subscribers.load();
 
-        for sub in subs.iter() {
+        for (_id, sub) in subs.iter() {
             let sub = sub.clone();
             let tx = tx.clone();
             
@@ -138,7 +269,7 @@ impl TxDispatcher {
             .map_err(|e| format!("Failed to build gRPC client: {:?}", e))?;
 
         // 获取账户过滤器
-        let account_filters = self.account_filters.load();
+        let account_filters = self.inner.account_filters.load();
         let account_include = match account_filters.as_ref() {
             Some(accounts) => {
                 info!("📋 使用账户过滤器，共 {} 个账户", accounts.len());
