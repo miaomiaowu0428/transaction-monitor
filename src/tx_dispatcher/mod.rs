@@ -1,6 +1,6 @@
 use grpc_client::TransactionFormat;
-use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 use futures::{SinkExt, StreamExt};
 
@@ -20,7 +20,7 @@ use arc_swap::ArcSwap;
 static SUBSCRIBER_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Subscriber 注册句柄，可用于取消注册
-/// 
+///
 /// 当 Handle 被 drop 时，会自动取消注册对应的 subscriber
 pub struct SubscriberHandle {
     id: u64,
@@ -40,7 +40,7 @@ impl SubscriberHandle {
     }
 
     /// 手动取消注册（提前释放）
-    /// 
+    ///
     /// 返回 true 表示成功取消注册，false 表示已经被取消或 dispatcher 已释放
     pub fn unregister(self) -> bool {
         if let Some(dispatcher) = self.dispatcher.upgrade() {
@@ -114,7 +114,9 @@ impl TxDispatcher {
     /// ```
     pub fn with_account_filters(&self, accounts: Vec<Pubkey>) -> &Self {
         let account_strings: Vec<String> = accounts.iter().map(|pk| pk.to_string()).collect();
-        self.inner.account_filters.store(Arc::new(Some(account_strings)));
+        self.inner
+            .account_filters
+            .store(Arc::new(Some(account_strings)));
         info!(
             "✅ TxDispatcher 账户过滤器已设置，共 {} 个账户",
             accounts.len()
@@ -130,7 +132,7 @@ impl TxDispatcher {
     }
 
     /// 注册 subscriber（旧接口，保持向后兼容）
-    /// 
+    ///
     /// 注意：使用此方法注册的 subscriber 无法取消注册
     /// 如需取消注册功能，请使用 `register_with_handle` 方法
     pub fn register(&self, sub: Arc<dyn TxSubscriber>) -> &Self {
@@ -140,9 +142,14 @@ impl TxDispatcher {
         new.insert(id, sub.clone());
         let count = new.len();
         self.inner.subscribers.store(Arc::new(new));
-        
-        info!("✅ Subscriber 已注册 [{}] ID: {}，当前共 {} 个 subscriber", sub.name(), id, count);
-        
+
+        info!(
+            "✅ Subscriber 已注册 [{}] ID: {}，当前共 {} 个 subscriber",
+            sub.name(),
+            id,
+            count
+        );
+
         self
     }
 
@@ -170,9 +177,14 @@ impl TxDispatcher {
         new.insert(id, sub.clone());
         let count = new.len();
         self.inner.subscribers.store(Arc::new(new));
-        
-        info!("✅ Subscriber 已注册 [{}] ID: {}，当前共 {} 个 subscriber", sub.name(), id, count);
-        
+
+        info!(
+            "✅ Subscriber 已注册 [{}] ID: {}，当前共 {} 个 subscriber",
+            sub.name(),
+            id,
+            count
+        );
+
         SubscriberHandle {
             id,
             subscriber: sub,
@@ -195,8 +207,11 @@ impl TxDispatcherInner {
             new.remove(&id);
             let count = new.len();
             self.subscribers.store(Arc::new(new));
-            
-            info!("✅ Subscriber 已取消注册 [{}] ID: {}，当前剩余 {} 个 subscriber", name, id, count);
+
+            info!(
+                "✅ Subscriber 已取消注册 [{}] ID: {}，当前剩余 {} 个 subscriber",
+                name, id, count
+            );
             true
         } else {
             false
@@ -214,7 +229,7 @@ impl TxDispatcher {
             let sub = sub.clone();
             let tx = tx.clone();
             let dispatcher = self.inner.clone();
-            
+
             tokio::spawn(async move {
                 match sub.interested(&tx).await {
                     Some(true) => {
@@ -341,6 +356,6 @@ impl TxDispatcher {
             }
         }
 
-        Ok(())
+        Err("grpc stream ends(should not happen)".into())
     }
 }

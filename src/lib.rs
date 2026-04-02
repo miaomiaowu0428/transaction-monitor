@@ -11,11 +11,11 @@ use tx_dispatcher::TxDispatcher;
 static GLOBAL_DISPATCHER: LazyLock<TxDispatcher> = LazyLock::new(|| TxDispatcher::new());
 
 /// 获取全局 dispatcher 引用
-/// 
+///
 /// # 示例
 /// ```rust,ignore
 /// use transaction_monitor::get_global_dispatcher;
-/// 
+///
 /// let handle = get_global_dispatcher().register_with_handle(Arc::new(my_subscriber));
 /// // ... 使用
 /// // handle drop 时自动注销

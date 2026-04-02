@@ -10,7 +10,7 @@ pub trait TxSubscriber: Send + Sync + 'static {
     fn name(&self) -> &'static str;
 
     /// 是否对这笔交易感兴趣（必须非常快）
-    /// 
+    ///
     /// 返回值：
     /// - Some(true): 感兴趣，会调用 on_tx
     /// - Some(false): 不感兴趣，跳过

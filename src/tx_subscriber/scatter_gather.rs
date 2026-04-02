@@ -487,7 +487,6 @@ impl ScatterGatherSubscriber {
     }
 }
 
-
 #[async_trait::async_trait]
 impl TxSubscriber for ScatterGatherSubscriber {
     fn name(&self) -> &'static str {
