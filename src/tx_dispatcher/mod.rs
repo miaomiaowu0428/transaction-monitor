@@ -1,3 +1,9 @@
+//! 交易分发器：管理 gRPC 连接并将交易广播给各 subscriber。
+//!
+//! 核心类型：
+//! - [`TxDispatcher`]：线程安全的分发器，支持动态注册/注销 subscriber、主动重连
+//! - [`SubscriberHandle`]：注册句柄，drop 时自动取消注册
+
 use grpc_client::TransactionFormat;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -17,6 +23,7 @@ use crate::tx_subscriber::TxSubscriber;
 
 use arc_swap::ArcSwap;
 
+/// 全局 subscriber ID 自增计数器，保证每个 subscriber 注册 ID 全局唯一。
 static SUBSCRIBER_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Subscriber 注册句柄，可用于取消注册
@@ -67,11 +74,16 @@ impl std::fmt::Debug for SubscriberHandle {
     }
 }
 
+/// 交易分发器的内部实现，通过 [`Arc`] 共享给 [`SubscriberHandle`]。
 struct TxDispatcherInner {
     subscribers: ArcSwap<HashMap<u64, Arc<dyn TxSubscriber>>>,
     account_filters: ArcSwap<Option<Vec<String>>>,
 }
 
+/// 线程安全的交易分发器。
+///
+/// 支持多 subscriber 并发处理，并内置带自动重连的 gRPC 订阅循环。
+/// 可安全地在多个线程中 clone 和共享。
 pub struct TxDispatcher {
     inner: Arc<TxDispatcherInner>,
 }
@@ -96,6 +108,7 @@ impl Clone for TxDispatcher {
 }
 
 impl TxDispatcher {
+    /// 创建空的 dispatcher，不含任何 subscriber 和过滤器。
     pub fn new() -> Self {
         Self::default()
     }
@@ -199,6 +212,7 @@ impl TxDispatcher {
 }
 
 impl TxDispatcherInner {
+    /// 按 ID 超找并移除 subscriber，成功返回 `true`。
     fn unregister_by_id(&self, id: u64) -> bool {
         let old = self.subscribers.load();
         if let Some(sub) = old.get(&id) {
@@ -220,6 +234,10 @@ impl TxDispatcherInner {
 }
 
 impl TxDispatcher {
+    /// 将一笔交易广播给所有已注册的 subscriber。
+    ///
+    /// 每个 subscriber 在独立的 tokio 任务中并发运行 `interested` 和 `on_tx`。
+    /// 返回 `None` 的 subscriber 会被自动移除。
     pub async fn dispatch(&self, tx: Arc<TransactionFormat>) {
         let subs = self.inner.subscribers.load();
 
@@ -250,6 +268,10 @@ impl TxDispatcher {
         }
     }
 
+    /// 启动 gRPC 监听循环，自动重连直到进程退出。
+    ///
+    /// 使用指数退避（最大 60s）应对网络中断。
+    /// gRPC URL 从环境变量 `YELLOWSTONE_GRPC_URL` 读取，token 从 `YELLOWSTONE_GRPC_TOKEN` 读取（可选）。
     pub async fn run(&self) {
         let url = std::env::var("YELLOWSTONE_GRPC_URL").expect("YELLOWSTONE_GRPC_URL must be set");
         let token = std::env::var("YELLOWSTONE_GRPC_TOKEN").ok();
@@ -285,6 +307,7 @@ impl TxDispatcher {
         }
     }
 
+    /// 建立一次性 gRPC 订阅并持续处理直到流结束或出错。
     async fn run_once(
         &self,
         url: &str,
