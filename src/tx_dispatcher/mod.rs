@@ -281,6 +281,7 @@ impl TxDispatcher {
     /// 使用指数退避（最大 60s）应对网络中断。
     /// gRPC URL 从环境变量 `YELLOWSTONE_GRPC_URL` 读取，token 从 `YELLOWSTONE_GRPC_TOKEN` 读取（可选）。
     pub async fn run(&self) {
+        // ── 读取连接配置 ─────────────────────────────────────────────────────
         let url = std::env::var("YELLOWSTONE_GRPC_URL").expect("YELLOWSTONE_GRPC_URL must be set");
         let token = std::env::var("YELLOWSTONE_GRPC_TOKEN").ok();
 
@@ -290,21 +291,26 @@ impl TxDispatcher {
             warn!("⚠️ 未设置 YELLOWSTONE_GRPC_TOKEN，请确保您使用的节点无需认证");
         }
 
+        // ── 重连退避参数 ─────────────────────────────────────────────────────
+        // 首次重连等 1s，之后每次翻倍，最多等 60s。
+        // gRPC 流正常结束时重置为 1s（说明节点只是重启，很快能连上）。
         let mut reconnect_delay = tokio::time::Duration::from_secs(1);
         let max_reconnect_delay = tokio::time::Duration::from_secs(60);
 
+        // ── 永久重连循环 ─────────────────────────────────────────────────────
         loop {
             info!("🔗 正在连接到 Yellowstone gRPC: {}", url);
 
             match self.run_once(&url, token.as_deref()).await {
                 Ok(_) => {
+                    // gRPC 流正常结束（极少见，节点可能做了优雅关闭）
                     warn!("⚠️ gRPC 流正常结束，准备重连...");
                     reconnect_delay = tokio::time::Duration::from_secs(1);
                 }
                 Err(e) => {
+                    // gRPC 流异常断开（网络抖动、节点崩溃等）
                     error!("❌ gRPC 连接错误: {}, 等待 {:?} 后重连", e, reconnect_delay);
                     tokio::time::sleep(reconnect_delay).await;
-
                     // 指数退避，最多到 max_reconnect_delay
                     reconnect_delay = (reconnect_delay * 2).min(max_reconnect_delay);
                 }
@@ -321,13 +327,20 @@ impl TxDispatcher {
         url: &str,
         token: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // ── ① 连接 gRPC 节点 ──────────────────────────────────────────────────
+        // 建立与 Yellowstone gRPC 的长连接，使用 TLS 加密。
+        // 如果节点要求 token 认证（通过 YELLOWSTONE_GRPC_TOKEN 环境变量传入），
+        // 此处会一并带上。
         let grpc = YellowstoneGrpc::new(url.to_string(), token.map(|s| s.to_string()));
         let client = grpc
             .build_client()
             .await
             .map_err(|e| format!("Failed to build gRPC client: {:?}", e))?;
 
-        // 获取账户过滤器
+        // ── ② 读取账户过滤器（决定交易流要监听哪些程序的交易）─────────────────
+        // account_filters 由外部通过 with_account_filters() 设置，
+        // 例如 PumpMigrateMonitor 设置为只监听 PUMP_PROGRAM_ID 的交易。
+        // 为 None 时 account_include 为空 vec，Yellowstone 视为"不过滤"（全量交易）。
         let account_filters = self.inner.account_filters.load();
         let account_include = match account_filters.as_ref() {
             Some(accounts) => {
@@ -340,7 +353,13 @@ impl TxDispatcher {
             }
         };
 
-        // 构建交易订阅过滤器（在 account_change 重发时需要复用）
+        // ── ③ 构建交易流过滤器（TxSubscriber 的数据来源）──────────────────────
+        // tx_filter 定义了我们从 Yellowstone 收到的交易要满足什么条件：
+        //   vote: false    → 排除投票交易
+        //   failed: false  → 排除失败交易
+        //   account_include → 只收涉及特定程序的交易（空 = 全量）
+        // 这个 filter 在整个连接生命周期内不变，但 account_change 重发订阅时
+        // 必须原样带上，否则交易订阅会被清空。
         let tx_filter = SubscribeRequestFilterTransactions {
             vote: Some(false),
             failed: Some(false),
@@ -350,6 +369,10 @@ impl TxDispatcher {
             account_required: vec![],
         };
 
+        // ── ④ 构建账户订阅过滤器（AccountSubs / WatchCreator 的数据来源）─────
+        // 闭包：从 account_subs 实时读取当前所有活跃的账户地址，
+        // 构建 SubscribeRequestFilterAccounts。空则返回空 HashMap（不订阅任何账户）。
+        // 每次 account_change_notify 触发时调用，确保只订阅当前需要的账户。
         let build_account_subs = |inner: &TxDispatcherInner| -> std::collections::HashMap<String, yellowstone_grpc_proto::geyser::SubscribeRequestFilterAccounts> {
             let subs = &inner.account_subs;
             let addrs: Vec<String> = subs.active_addresses().iter().map(|a| a.to_string()).collect();
@@ -368,6 +391,9 @@ impl TxDispatcher {
             }
         };
 
+        // ── ⑤ 发送初始订阅请求 ───────────────────────────────────────────────
+        // 同时订阅交易流 (transactions) 和账户更新流 (accounts)。
+        // commitment = Processed：交易/账户一旦被节点处理就推送，延迟最低。
         let subscribe_request = SubscribeRequest {
             transactions: std::collections::HashMap::from([(
                 "trade-monitor".to_string(),
@@ -378,6 +404,8 @@ impl TxDispatcher {
             ..Default::default()
         };
 
+        // subscribe_tx：用于后续发送心跳 (pong) 和更新订阅。
+        // stream：接收节点推送的交易、账户更新、心跳请求。
         let (mut subscribe_tx, mut stream) = client
             .lock()
             .await
@@ -386,15 +414,19 @@ impl TxDispatcher {
 
         info!("✅ gRPC 订阅成功，开始监听交易+账户");
 
+        // ── ⑥ 事件循环：同时监听 gRPC 消息流 和 账户订阅变更通知 ─────────────
         loop {
             tokio::select! {
+                // ─── 分支 A：gRPC 流有消息到达 ───────────────────────────────
                 message = stream.next() => {
                     match message {
                         Some(Ok(msg)) => match msg.update_oneof {
+                            // A1. 交易事件：转换成 TransactionFormat，分发给所有 TxSubscriber
                             Some(UpdateOneof::Transaction(sut)) => {
                                 let tx: TransactionFormat = sut.into();
                                 self.dispatch(Arc::new(tx)).await;
                             }
+                            // A2. 心跳请求 (Ping)：回复 Pong 保持连接活跃
                             Some(UpdateOneof::Ping(_)) => {
                                 let _ = subscribe_tx
                                     .send(SubscribeRequest {
@@ -403,6 +435,7 @@ impl TxDispatcher {
                                     })
                                     .await;
                             }
+                            // A3. 账户更新：交给 AccountSubs 触发回调 (WatchCreator 等)
                             Some(UpdateOneof::Account(acct)) => {
                                 if let Some(info) = acct.account {
                                     if let Ok(addr) = Pubkey::try_from(info.pubkey) {
@@ -410,20 +443,25 @@ impl TxDispatcher {
                                     }
                                 }
                             }
+                            // A4. 其他消息类型（slot、entry 等）：忽略
                             _ => {}
                         },
+                        // gRPC 流错误：抛给外层 run() 触发重连
                         Some(Err(error)) => {
                             return Err(format!("gRPC stream error: {:?}", error).into());
                         }
+                        // gRPC 流正常结束（极少发生）：返回 Ok，外层 run() 也会重连
                         None => {
                             warn!("gRPC stream ended");
                             return Ok(());
                         }
                     }
                 }
+                // ─── 分支 B：账户订阅列表有变更（有人新增/取消订阅了账户）───────
+                // 注意：这里需要重新发送完整的 SubscribeRequest（同时带上 transactions
+                // 和 accounts），因为 Yellowstone gRPC 每次 send 是"替换"而非"合并"。
+                // 只发 accounts 会导致 transactions 订阅被清空，所有 TxSubscriber 断流。
                 _ = self.inner.account_change_notify.notified() => {
-                    // 重发订阅请求时必须同时保留 transactions 和 accounts，
-                    // 否则 Yellowstone gRPC 替换模式下会丢失其中一个订阅。
                     let updated_accounts = build_account_subs(&self.inner);
                     let _ = subscribe_tx
                         .send(SubscribeRequest {
