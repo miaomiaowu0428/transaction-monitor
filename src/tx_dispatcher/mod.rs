@@ -4,6 +4,8 @@
 //! - [`TxDispatcher`]：线程安全的分发器，支持动态注册/注销 subscriber、主动重连
 //! - [`SubscriberHandle`]：注册句柄，drop 时自动取消注册
 
+pub mod account_sub;
+
 use grpc_client::TransactionFormat;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -20,6 +22,7 @@ use yellowstone_grpc_proto::geyser::{
 };
 
 use crate::tx_subscriber::TxSubscriber;
+use account_sub::AccountSubs;
 
 use arc_swap::ArcSwap;
 
@@ -78,6 +81,9 @@ impl std::fmt::Debug for SubscriberHandle {
 struct TxDispatcherInner {
     subscribers: ArcSwap<HashMap<u64, Arc<dyn TxSubscriber>>>,
     account_filters: ArcSwap<Option<Vec<String>>>,
+    account_subs: AccountSubs,
+    /// 账户订阅变更时通知 gRPC 循环重新发送 SubscribeRequest
+    account_change_notify: tokio::sync::Notify,
 }
 
 /// 线程安全的交易分发器。
@@ -94,6 +100,8 @@ impl Default for TxDispatcher {
             inner: Arc::new(TxDispatcherInner {
                 subscribers: ArcSwap::from_pointee(HashMap::new()),
                 account_filters: ArcSwap::from_pointee(None),
+                account_subs: AccountSubs::new(),
+                account_change_notify: tokio::sync::Notify::new(),
             }),
         }
     }
@@ -332,20 +340,40 @@ impl TxDispatcher {
             }
         };
 
-        let subscribe_request = SubscribeRequest {
-            transactions: HashMap::from([(
-                "trade-monitor".to_string(),
-                SubscribeRequestFilterTransactions {
-                    vote: Some(false),
-                    failed: Some(false),
-                    signature: None,
-                    account_include,
-                    account_exclude: vec![],
-                    account_required: vec![],
-                },
-            )]),
-            commitment: Some(CommitmentLevel::Processed.into()),
-            ..Default::default()
+        let subscribe_request = {
+            let account_subs: std::collections::HashMap<String, yellowstone_grpc_proto::geyser::SubscribeRequestFilterAccounts> = {
+                let subs = &self.inner.account_subs;
+                let addrs: Vec<String> = subs.active_addresses().iter().map(|a| a.to_string()).collect();
+                if addrs.is_empty() {
+                    std::collections::HashMap::new()
+                } else {
+                    std::collections::HashMap::from([(
+                        "acc".to_string(),
+                        yellowstone_grpc_proto::geyser::SubscribeRequestFilterAccounts {
+                            account: addrs,
+                            owner: vec![],
+                            filters: vec![],
+                            nonempty_txn_signature: None,
+                        },
+                    )])
+                }
+            };
+            SubscribeRequest {
+                transactions: std::collections::HashMap::from([(
+                    "trade-monitor".to_string(),
+                    SubscribeRequestFilterTransactions {
+                        vote: Some(false),
+                        failed: Some(false),
+                        signature: None,
+                        account_include,
+                        account_exclude: vec![],
+                        account_required: vec![],
+                    },
+                )]),
+                accounts: account_subs,
+                commitment: Some(CommitmentLevel::Processed.into()),
+                ..Default::default()
+            }
         };
 
         let (mut subscribe_tx, mut stream) = client
@@ -354,31 +382,65 @@ impl TxDispatcher {
             .subscribe_with_request(Some(subscribe_request))
             .await?;
 
-        info!("✅ gRPC 订阅成功，开始监听交易");
+        info!("✅ gRPC 订阅成功，开始监听交易+账户");
 
-        while let Some(message) = stream.next().await {
-            match message {
-                Ok(msg) => match msg.update_oneof {
-                    Some(UpdateOneof::Transaction(sut)) => {
-                        let tx: TransactionFormat = sut.into();
-                        self.dispatch(Arc::new(tx)).await;
+        loop {
+            tokio::select! {
+                message = stream.next() => {
+                    match message {
+                        Some(Ok(msg)) => match msg.update_oneof {
+                            Some(UpdateOneof::Transaction(sut)) => {
+                                let tx: TransactionFormat = sut.into();
+                                self.dispatch(Arc::new(tx)).await;
+                            }
+                            Some(UpdateOneof::Ping(_)) => {
+                                let _ = subscribe_tx
+                                    .send(SubscribeRequest {
+                                        ping: Some(SubscribeRequestPing { id: 1 }),
+                                        ..Default::default()
+                                    })
+                                    .await;
+                            }
+                            Some(UpdateOneof::Account(acct)) => {
+                                if let Some(info) = acct.account {
+                                    if let Ok(addr) = Pubkey::try_from(info.pubkey) {
+                                        self.inner.account_subs.update_and_fire(&addr, info.data, 0);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        },
+                        Some(Err(error)) => {
+                            return Err(format!("gRPC stream error: {:?}", error).into());
+                        }
+                        None => {
+                            warn!("gRPC stream ended");
+                            return Ok(());
+                        }
                     }
-                    Some(UpdateOneof::Ping(_)) => {
-                        let _ = subscribe_tx
-                            .send(SubscribeRequest {
-                                ping: Some(SubscribeRequestPing { id: 1 }),
-                                ..Default::default()
-                            })
-                            .await;
-                    }
-                    _ => {}
-                },
-                Err(error) => {
-                    return Err(format!("gRPC stream error: {:?}", error).into());
+                }
+                _ = self.inner.account_change_notify.notified() => {
+                    let updated: Vec<String> = self.inner.account_subs.active_addresses()
+                        .iter().map(|a| a.to_string()).collect();
+                    let filter = if updated.is_empty() {
+                        std::collections::HashMap::new()
+                    } else {
+                        std::collections::HashMap::from([(
+                            "acc".to_string(),
+                            yellowstone_grpc_proto::geyser::SubscribeRequestFilterAccounts {
+                                account: updated,
+                                owner: vec![],
+                                filters: vec![],
+                                nonempty_txn_signature: None,
+                            },
+                        )])
+                    };
+                    let _ = subscribe_tx
+                        .send(SubscribeRequest { accounts: filter, ..Default::default() })
+                        .await;
                 }
             }
         }
-
-        Err("grpc stream ends(should not happen)".into())
     }
 }
+

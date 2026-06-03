@@ -6,7 +6,6 @@
 use grpc_client::TransactionFormat;
 use std::sync::Arc;
 
-
 #[async_trait::async_trait]
 pub trait TxSubscriber: Send + Sync + 'static {
     /// 模块名字，仅用于日志
