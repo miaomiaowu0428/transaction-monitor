@@ -340,40 +340,42 @@ impl TxDispatcher {
             }
         };
 
-        let subscribe_request = {
-            let account_subs: std::collections::HashMap<String, yellowstone_grpc_proto::geyser::SubscribeRequestFilterAccounts> = {
-                let subs = &self.inner.account_subs;
-                let addrs: Vec<String> = subs.active_addresses().iter().map(|a| a.to_string()).collect();
-                if addrs.is_empty() {
-                    std::collections::HashMap::new()
-                } else {
-                    std::collections::HashMap::from([(
-                        "acc".to_string(),
-                        yellowstone_grpc_proto::geyser::SubscribeRequestFilterAccounts {
-                            account: addrs,
-                            owner: vec![],
-                            filters: vec![],
-                            nonempty_txn_signature: None,
-                        },
-                    )])
-                }
-            };
-            SubscribeRequest {
-                transactions: std::collections::HashMap::from([(
-                    "trade-monitor".to_string(),
-                    SubscribeRequestFilterTransactions {
-                        vote: Some(false),
-                        failed: Some(false),
-                        signature: None,
-                        account_include,
-                        account_exclude: vec![],
-                        account_required: vec![],
+        // 构建交易订阅过滤器（在 account_change 重发时需要复用）
+        let tx_filter = SubscribeRequestFilterTransactions {
+            vote: Some(false),
+            failed: Some(false),
+            signature: None,
+            account_include,
+            account_exclude: vec![],
+            account_required: vec![],
+        };
+
+        let build_account_subs = |inner: &TxDispatcherInner| -> std::collections::HashMap<String, yellowstone_grpc_proto::geyser::SubscribeRequestFilterAccounts> {
+            let subs = &inner.account_subs;
+            let addrs: Vec<String> = subs.active_addresses().iter().map(|a| a.to_string()).collect();
+            if addrs.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                std::collections::HashMap::from([(
+                    "acc".to_string(),
+                    yellowstone_grpc_proto::geyser::SubscribeRequestFilterAccounts {
+                        account: addrs,
+                        owner: vec![],
+                        filters: vec![],
+                        nonempty_txn_signature: None,
                     },
-                )]),
-                accounts: account_subs,
-                commitment: Some(CommitmentLevel::Processed.into()),
-                ..Default::default()
+                )])
             }
+        };
+
+        let subscribe_request = SubscribeRequest {
+            transactions: std::collections::HashMap::from([(
+                "trade-monitor".to_string(),
+                tx_filter.clone(),
+            )]),
+            accounts: build_account_subs(&self.inner),
+            commitment: Some(CommitmentLevel::Processed.into()),
+            ..Default::default()
         };
 
         let (mut subscribe_tx, mut stream) = client
@@ -420,23 +422,18 @@ impl TxDispatcher {
                     }
                 }
                 _ = self.inner.account_change_notify.notified() => {
-                    let updated: Vec<String> = self.inner.account_subs.active_addresses()
-                        .iter().map(|a| a.to_string()).collect();
-                    let filter = if updated.is_empty() {
-                        std::collections::HashMap::new()
-                    } else {
-                        std::collections::HashMap::from([(
-                            "acc".to_string(),
-                            yellowstone_grpc_proto::geyser::SubscribeRequestFilterAccounts {
-                                account: updated,
-                                owner: vec![],
-                                filters: vec![],
-                                nonempty_txn_signature: None,
-                            },
-                        )])
-                    };
+                    // 重发订阅请求时必须同时保留 transactions 和 accounts，
+                    // 否则 Yellowstone gRPC 替换模式下会丢失其中一个订阅。
+                    let updated_accounts = build_account_subs(&self.inner);
                     let _ = subscribe_tx
-                        .send(SubscribeRequest { accounts: filter, ..Default::default() })
+                        .send(SubscribeRequest {
+                            transactions: std::collections::HashMap::from([(
+                                "trade-monitor".to_string(),
+                                tx_filter.clone(),
+                            )]),
+                            accounts: updated_accounts,
+                            ..Default::default()
+                        })
                         .await;
                 }
             }
