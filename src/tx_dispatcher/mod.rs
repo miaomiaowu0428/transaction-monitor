@@ -470,6 +470,7 @@ impl TxDispatcher {
                                 tx_filter.clone(),
                             )]),
                             accounts: updated_accounts,
+                            commitment: Some(CommitmentLevel::Processed.into()),
                             ..Default::default()
                         })
                         .await;
