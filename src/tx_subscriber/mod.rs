@@ -6,10 +6,22 @@
 use grpc_client::TransactionFormat;
 use std::sync::Arc;
 
+/// 注册时缓存的 subscriber 元数据，dispatch 热路径避免虚函数调用。
+#[derive(Clone)]
+pub(crate) struct SubscriberEntry {
+    pub sub: Arc<dyn TxSubscriber>,
+    pub accept_failed: bool,
+}
+
 #[async_trait::async_trait]
 pub trait TxSubscriber: Send + Sync + 'static {
     /// 模块名字，仅用于日志
     fn name(&self) -> &'static str;
+
+    /// 是否接收失败交易。默认 false。需要失败 tx 的 subscriber 覆盖为 true。
+    fn accept_failed(&self) -> bool {
+        false
+    }
 
     /// 是否对这笔交易感兴趣（必须非常快）
     ///

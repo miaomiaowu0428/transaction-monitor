@@ -21,7 +21,7 @@ use yellowstone_grpc_proto::geyser::{
     subscribe_update::UpdateOneof,
 };
 
-use crate::tx_subscriber::TxSubscriber;
+use crate::tx_subscriber::{TxSubscriber, SubscriberEntry};
 use account_sub::AccountSubs;
 
 use arc_swap::ArcSwap;
@@ -79,7 +79,7 @@ impl std::fmt::Debug for SubscriberHandle {
 
 /// 交易分发器的内部实现，通过 [`Arc`] 共享给 [`SubscriberHandle`]。
 struct TxDispatcherInner {
-    subscribers: ArcSwap<HashMap<u64, Arc<dyn TxSubscriber>>>,
+    subscribers: ArcSwap<HashMap<u64, SubscriberEntry>>,
     account_filters: ArcSwap<Option<Vec<String>>>,
     account_subs: AccountSubs,
     /// 账户订阅变更时通知 gRPC 循环重新发送 SubscribeRequest
@@ -158,9 +158,11 @@ impl TxDispatcher {
     /// 如需取消注册功能，请使用 `register_with_handle` 方法
     pub fn register(&self, sub: Arc<dyn TxSubscriber>) -> &Self {
         let id = SUBSCRIBER_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let accept_failed = sub.accept_failed();
+        let entry = SubscriberEntry { sub: sub.clone(), accept_failed };
         let old = self.inner.subscribers.load();
         let mut new = (**old).clone();
-        new.insert(id, sub.clone());
+        new.insert(id, entry);
         let count = new.len();
         self.inner.subscribers.store(Arc::new(new));
 
@@ -193,9 +195,11 @@ impl TxDispatcher {
     /// ```
     pub fn register_with_handle(&self, sub: Arc<dyn TxSubscriber>) -> SubscriberHandle {
         let id = SUBSCRIBER_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let accept_failed = sub.accept_failed();
+        let entry = SubscriberEntry { sub: sub.clone(), accept_failed };
         let old = self.inner.subscribers.load();
         let mut new = (**old).clone();
-        new.insert(id, sub.clone());
+        new.insert(id, entry);
         let count = new.len();
         self.inner.subscribers.store(Arc::new(new));
 
@@ -223,8 +227,8 @@ impl TxDispatcherInner {
     /// 按 ID 超找并移除 subscriber，成功返回 `true`。
     fn unregister_by_id(&self, id: u64) -> bool {
         let old = self.subscribers.load();
-        if let Some(sub) = old.get(&id) {
-            let name = sub.name();
+        if let Some(entry) = old.get(&id) {
+            let name = entry.sub.name();
             let mut new = (**old).clone();
             new.remove(&id);
             let count = new.len();
@@ -248,27 +252,28 @@ impl TxDispatcher {
     /// 返回 `None` 的 subscriber 会被自动移除。
     pub async fn dispatch(&self, tx: Arc<TransactionFormat>) {
         let subs = self.inner.subscribers.load();
+        let is_failed = tx.meta.as_ref().map(|m| m.status.is_err()).unwrap_or(true);
 
         // 为每个 subscriber 独立 spawn 任务
-        for (id, sub) in subs.iter() {
+        for (id, entry) in subs.iter() {
+            // 失败交易：只有 accept_failed 的 subscriber 才处理
+            if is_failed && !entry.accept_failed {
+                continue;
+            }
             let id = *id;
-            let sub = sub.clone();
+            let sub = entry.sub.clone();
             let tx = tx.clone();
             let dispatcher = self.inner.clone();
 
             tokio::spawn(async move {
                 match sub.interested(&tx).await {
                     Some(true) => {
-                        // 感兴趣，spawn on_tx 处理
                         tokio::spawn(async move {
                             sub.on_tx(tx).await;
                         });
                     }
-                    Some(false) => {
-                        // 不感兴趣，跳过
-                    }
+                    Some(false) => {}
                     None => {
-                        // 请求注销，立即执行
                         dispatcher.unregister_by_id(id);
                     }
                 }
@@ -362,7 +367,7 @@ impl TxDispatcher {
         // 必须原样带上，否则交易订阅会被清空。
         let tx_filter = SubscribeRequestFilterTransactions {
             vote: Some(false),
-            failed: Some(false),
+            failed: None,  // 接收全部交易（成功+失败），由 subscriber.accept_failed() 过滤
             signature: None,
             account_include,
             account_exclude: vec![],
