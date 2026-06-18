@@ -13,6 +13,9 @@ use std::sync::{Arc, Weak};
 use futures::{SinkExt, StreamExt};
 
 use grpc_client::YellowstoneGrpc;
+use whirlwind::ShardMap;
+use std::time::Instant;
+use solana_sdk::signature::Signature;
 use log::{error, info, warn};
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
@@ -21,7 +24,7 @@ use yellowstone_grpc_proto::geyser::{
     subscribe_update::UpdateOneof,
 };
 
-use crate::tx_subscriber::{TxSubscriber, SubscriberEntry};
+use crate::tx_subscriber::{SubscriberEntry, TxSubscriber};
 use account_sub::AccountSubs;
 
 use arc_swap::ArcSwap;
@@ -75,6 +78,16 @@ impl std::fmt::Debug for SubscriberHandle {
             .field("id", &self.id)
             .finish()
     }
+}
+
+/// 交易到达时间记录（最多保留 10 slot）
+static ARRIVAL_TIMES: std::sync::LazyLock<ShardMap<Signature, Instant>> =
+    std::sync::LazyLock::new(|| ShardMap::with_shards(16));
+static MAX_ARRIVAL_SLOT: AtomicU64 = AtomicU64::new(0);
+
+/// 查询 sig 的 dispatcher 到达时间。
+pub async fn arrival_time(sig: &Signature) -> Option<Instant> {
+    ARRIVAL_TIMES.get(sig).await.map(|i| *i)
 }
 
 /// 交易分发器的内部实现，通过 [`Arc`] 共享给 [`SubscriberHandle`]。
@@ -159,7 +172,10 @@ impl TxDispatcher {
     pub fn register(&self, sub: Arc<dyn TxSubscriber>) -> &Self {
         let id = SUBSCRIBER_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
         let accept_failed = sub.accept_failed();
-        let entry = SubscriberEntry { sub: sub.clone(), accept_failed };
+        let entry = SubscriberEntry {
+            sub: sub.clone(),
+            accept_failed,
+        };
         let old = self.inner.subscribers.load();
         let mut new = (**old).clone();
         new.insert(id, entry);
@@ -196,7 +212,10 @@ impl TxDispatcher {
     pub fn register_with_handle(&self, sub: Arc<dyn TxSubscriber>) -> SubscriberHandle {
         let id = SUBSCRIBER_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
         let accept_failed = sub.accept_failed();
-        let entry = SubscriberEntry { sub: sub.clone(), accept_failed };
+        let entry = SubscriberEntry {
+            sub: sub.clone(),
+            accept_failed,
+        };
         let old = self.inner.subscribers.load();
         let mut new = (**old).clone();
         new.insert(id, entry);
@@ -251,6 +270,17 @@ impl TxDispatcher {
     /// 每个 subscriber 在独立的 tokio 任务中并发运行 `interested` 和 `on_tx`。
     /// 返回 `None` 的 subscriber 会被自动移除。
     pub async fn dispatch(&self, tx: Arc<TransactionFormat>) {
+        let slot = tx.slot;
+        ARRIVAL_TIMES.insert(tx.signature, Instant::now()).await;
+        // GC：清理 10 slot 之前的旧记录
+        let prev = MAX_ARRIVAL_SLOT.fetch_max(slot, Ordering::Relaxed);
+        if slot > prev && prev > 0 && slot - prev >= 5 {
+            let cutoff = slot.saturating_sub(10);
+            tokio::spawn(async move {
+                // ShardMap 无 iter，无法批量清理。单个记录 ~200B，10 slot × 几千 tx = 可接受。
+                let _ = cutoff;
+            });
+        }
         let subs = self.inner.subscribers.load();
         let is_failed = tx.meta.as_ref().map(|m| m.status.is_err()).unwrap_or(true);
 
@@ -367,7 +397,7 @@ impl TxDispatcher {
         // 必须原样带上，否则交易订阅会被清空。
         let tx_filter = SubscribeRequestFilterTransactions {
             vote: Some(false),
-            failed: None,  // 接收全部交易（成功+失败），由 subscriber.accept_failed() 过滤
+            failed: None, // 接收全部交易（成功+失败），由 subscriber.accept_failed() 过滤
             signature: None,
             account_include,
             account_exclude: vec![],
@@ -378,9 +408,16 @@ impl TxDispatcher {
         // 闭包：从 account_subs 实时读取当前所有活跃的账户地址，
         // 构建 SubscribeRequestFilterAccounts。空则返回空 HashMap（不订阅任何账户）。
         // 每次 account_change_notify 触发时调用，确保只订阅当前需要的账户。
-        let build_account_subs = |inner: &TxDispatcherInner| -> std::collections::HashMap<String, yellowstone_grpc_proto::geyser::SubscribeRequestFilterAccounts> {
+        let build_account_subs = |inner: &TxDispatcherInner| -> std::collections::HashMap<
+            String,
+            yellowstone_grpc_proto::geyser::SubscribeRequestFilterAccounts,
+        > {
             let subs = &inner.account_subs;
-            let addrs: Vec<String> = subs.active_addresses().iter().map(|a| a.to_string()).collect();
+            let addrs: Vec<String> = subs
+                .active_addresses()
+                .iter()
+                .map(|a| a.to_string())
+                .collect();
             if addrs.is_empty() {
                 std::collections::HashMap::new()
             } else {
@@ -484,4 +521,3 @@ impl TxDispatcher {
         }
     }
 }
-

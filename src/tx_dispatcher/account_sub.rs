@@ -6,8 +6,8 @@
 //! gRPC 在首次订阅时推送当前数据，后续只推送变化。
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use solana_sdk::pubkey::Pubkey;
 
@@ -25,7 +25,11 @@ pub struct AccountHandle {
 
 impl AccountHandle {
     fn new(id: u64, addr: Pubkey, dispatcher: Weak<TxDispatcherInner>) -> Self {
-        Self { id, addr, dispatcher }
+        Self {
+            id,
+            addr,
+            dispatcher,
+        }
     }
 }
 
@@ -52,11 +56,15 @@ pub(crate) struct AccountSubs {
 
 impl AccountSubs {
     pub fn new() -> Self {
-        Self { states: Mutex::new(HashMap::new()) }
+        Self {
+            states: Mutex::new(HashMap::new()),
+        }
     }
 
     pub fn active_addresses(&self) -> Vec<Pubkey> {
-        self.states.lock().unwrap()
+        self.states
+            .lock()
+            .unwrap()
             .iter()
             .filter(|(_, s)| !s.callbacks.is_empty() || s.bare_sub_count > 0)
             .map(|(a, _)| *a)
@@ -74,7 +82,9 @@ impl AccountSubs {
     }
 
     pub fn get_latest(&self, addr: &Pubkey) -> Option<(Vec<u8>, u64)> {
-        self.states.lock().unwrap()
+        self.states
+            .lock()
+            .unwrap()
             .get(addr)
             .and_then(|s| s.latest.clone())
     }
@@ -85,13 +95,18 @@ impl AccountSubs {
 impl crate::tx_dispatcher::TxDispatcher {
     /// 注册账户更新回调。handle drop 时自动移除。
     pub fn on_account_update<F>(&self, addr: &Pubkey, callback: F) -> AccountHandle
-    where F: Fn(&Pubkey, &[u8], u64) + Send + Sync + 'static
+    where
+        F: Fn(&Pubkey, &[u8], u64) + Send + Sync + 'static,
     {
         let id = ACCOUNT_HANDLE_ID.fetch_add(1, Ordering::SeqCst);
         {
             let subs = &self.inner.account_subs;
             let mut states = subs.states.lock().unwrap();
-            states.entry(*addr).or_default().callbacks.insert(id, Box::new(callback));
+            states
+                .entry(*addr)
+                .or_default()
+                .callbacks
+                .insert(id, Box::new(callback));
         }
         self.inner.notify_account_change();
         AccountHandle::new(id, *addr, Arc::downgrade(&self.inner))
@@ -110,7 +125,11 @@ impl crate::tx_dispatcher::TxDispatcher {
     }
 
     /// 从缓存读取最近一次推送的账户数据。`if_match` 接收 `&[u8]` 返回 `Option<T>`。
-    pub fn get_account<T>(&self, addr: &Pubkey, if_match: impl FnOnce(&[u8]) -> Option<T>) -> Option<T> {
+    pub fn get_account<T>(
+        &self,
+        addr: &Pubkey,
+        if_match: impl FnOnce(&[u8]) -> Option<T>,
+    ) -> Option<T> {
         let subs = &self.inner.account_subs;
         let (data, _) = subs.get_latest(addr)?;
         if_match(&data)
