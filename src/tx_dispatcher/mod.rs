@@ -106,6 +106,10 @@ struct TxDispatcherInner {
     ///
     /// 所以 gRPC 循环改成**电平触发**：定时比对代际计数，不等就重发。
     account_change_gen: AtomicU64,
+    /// 已经主动拉过初值的账户（每个地址只拉一次）。
+    primed: std::sync::Mutex<std::collections::HashSet<Pubkey>>,
+    /// 限制初值拉取的并发度，避免一次订阅几百个账户时把 RPC 打爆。
+    prime_sem: Arc<tokio::sync::Semaphore>,
 }
 
 /// 线程安全的交易分发器。
@@ -125,6 +129,8 @@ impl Default for TxDispatcher {
                 account_subs: AccountSubs::new(),
                 account_change_notify: tokio::sync::Notify::new(),
                 account_change_gen: AtomicU64::new(0),
+                primed: std::sync::Mutex::new(std::collections::HashSet::new()),
+                prime_sem: Arc::new(tokio::sync::Semaphore::new(account_sub::PRIME_CONCURRENCY)),
             }),
         }
     }

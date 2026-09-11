@@ -14,7 +14,7 @@ solana-client = "3.1.8"
 solana-sdk = "3.0.0"
 solana-transaction-status-client-types = "3.1.8"
 solana-tx-parser = { git = "https://github.com/miaomiaowu0428/solana-tx-parser.git" }
-tokio = "1.49.0"
+tokio = { version = "1.49.0", features = ["rt", "sync", "time"] }
 grpc-client = { git = "https://github.com/miaomiaowu0428/grpc-client.git" }
 anyhow = "1.0.100"
 env_logger = "0.11.8"
