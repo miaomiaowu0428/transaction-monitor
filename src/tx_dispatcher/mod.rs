@@ -505,7 +505,10 @@ impl TxDispatcher {
                 // 只发 accounts 会导致 transactions 订阅被清空，所有 TxSubscriber 断流。
                 _ = self.inner.account_change_notify.notified() => {
                     let updated_accounts = build_account_subs(&self.inner);
-                    let _ = subscribe_tx
+                    let n: usize = updated_accounts.values().map(|f| f.account.len()).sum();
+                    // 注意：这里**不能**吞掉错误 —— 发送失败意味着订阅停留在旧列表，
+                    // 之后新增的账户（tick_array / bin_array 等）永远收不到数据。
+                    match subscribe_tx
                         .send(SubscribeRequest {
                             transactions: std::collections::HashMap::from([(
                                 "trade-monitor".to_string(),
@@ -515,7 +518,11 @@ impl TxDispatcher {
                             commitment: Some(CommitmentLevel::Processed.into()),
                             ..Default::default()
                         })
-                        .await;
+                        .await
+                    {
+                        Ok(()) => info!("🔁 重发订阅成功：transactions + {n} 个账户"),
+                        Err(e) => error!("❌ 重发订阅失败（账户数 {n}）：{e} —— 订阅已停留在旧列表！"),
+                    }
                 }
             }
         }
