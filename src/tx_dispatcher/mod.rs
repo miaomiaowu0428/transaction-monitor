@@ -466,7 +466,14 @@ impl TxDispatcher {
 
         info!("✅ gRPC 订阅成功，开始监听交易+账户");
 
-        // ── ⑥ 事件循环：同时监听 gRPC 消息流 和 账户订阅变更通知 ─────────────
+        // ── ⑥ 事件循环：同时监听 gRPC 消息流 和 账户订阅变更 ─────────────
+        //
+        // 账户订阅用「代际计数 + 定时电平检查」而**不是**纯 Notify：
+        // `Notify` 是边沿触发，`select!` 里若交易流分支先就绪，`notified()` future
+        // 会被 drop 而**丢掉通知**；`notify_one()` 又只存 1 个许可 —— 一次新增
+        // 几十个账户时那次通知一旦丢失，这批账户就**永远订不上**。
+        let mut sub_tick = tokio::time::interval(tokio::time::Duration::from_millis(500));
+        let mut sent_gen = self.inner.account_change_gen.load(Ordering::Relaxed);
         loop {
             tokio::select! {
                 // ─── 分支 A：gRPC 流有消息到达 ───────────────────────────────
