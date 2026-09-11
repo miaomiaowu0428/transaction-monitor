@@ -250,13 +250,25 @@ impl TxDispatcherInner {
     }
 
     pub(crate) fn remove_account_entry(&self, addr: Pubkey, id: u64) {
-        let mut states = self.account_subs.states.lock().unwrap();
-        if let Some(s) = states.get_mut(&addr) {
-            s.callbacks.remove(&id);
-            s.bare_sub_count = s.bare_sub_count.saturating_sub(1);
-            if s.callbacks.is_empty() && s.bare_sub_count == 0 {
-                states.remove(&addr);
+        let emptied = {
+            let mut states = self.account_subs.states.lock().unwrap();
+            match states.get_mut(&addr) {
+                Some(s) => {
+                    s.callbacks.remove(&id);
+                    s.bare_sub_count = s.bare_sub_count.saturating_sub(1);
+                    if s.callbacks.is_empty() && s.bare_sub_count == 0 {
+                        states.remove(&addr);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                None => false,
             }
+        };
+        if emptied {
+            // 完全退订后允许下次重新订阅时再拉一次初值
+            self.primed.lock().unwrap().remove(&addr);
         }
         // 通知 gRPC 流重新发送订阅请求
         // 代际计数 +1 是**可靠**的信号（电平）；Notify 仅作为快速唤醒（边沿，会丢）
