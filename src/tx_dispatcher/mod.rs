@@ -97,6 +97,15 @@ struct TxDispatcherInner {
     account_subs: AccountSubs,
     /// 账户订阅变更时通知 gRPC 循环重新发送 SubscribeRequest
     account_change_notify: tokio::sync::Notify,
+    /// 账户订阅列表的**代际计数**：每次变更 +1。
+    ///
+    /// 单靠 [`Self::account_change_notify`] 是不可靠的 —— `Notify` 是**边沿触发**，
+    /// 在 `select!` 里若其它分支先就绪，`notified()` future 会被 drop 而**丢掉通知**；
+    /// 且 `notify_one()` 同时只存 1 个许可。订阅列表一次新增几十个地址时，
+    /// 那次通知一旦丢失，这批地址就**永远不会被订上**。
+    ///
+    /// 所以 gRPC 循环改成**电平触发**：定时比对代际计数，不等就重发。
+    account_change_gen: AtomicU64,
 }
 
 /// 线程安全的交易分发器。
@@ -115,6 +124,7 @@ impl Default for TxDispatcher {
                 account_filters: ArcSwap::from_pointee(None),
                 account_subs: AccountSubs::new(),
                 account_change_notify: tokio::sync::Notify::new(),
+                account_change_gen: AtomicU64::new(0),
             }),
         }
     }
@@ -499,15 +509,17 @@ impl TxDispatcher {
                         }
                     }
                 }
-                // ─── 分支 B：账户订阅列表有变更（有人新增/取消订阅了账户）───────
-                // 注意：这里需要重新发送完整的 SubscribeRequest（同时带上 transactions
-                // 和 accounts），因为 Yellowstone gRPC 每次 send 是"替换"而非"合并"。
-                // 只发 accounts 会导致 transactions 订阅被清空，所有 TxSubscriber 断流。
-                _ = self.inner.account_change_notify.notified() => {
+                // ─── 分支 B：账户订阅列表可能变了 ─────────────────────
+                // 电平触发：每 500ms 比一次代际计数，不等才重发。
+                // 重发失败时**不**更新 `sent_gen`，下个 tick 会自动重试。
+                // 注意必须带上 transactions，否则交易订阅会被清空。
+                _ = sub_tick.tick() => {
+                    let gen = self.inner.account_change_gen.load(Ordering::Relaxed);
+                    if gen == sent_gen {
+                        continue;
+                    }
                     let updated_accounts = build_account_subs(&self.inner);
                     let n: usize = updated_accounts.values().map(|f| f.account.len()).sum();
-                    // 注意：这里**不能**吞掉错误 —— 发送失败意味着订阅停留在旧列表，
-                    // 之后新增的账户（tick_array / bin_array 等）永远收不到数据。
                     match subscribe_tx
                         .send(SubscribeRequest {
                             transactions: std::collections::HashMap::from([(
@@ -520,8 +532,11 @@ impl TxDispatcher {
                         })
                         .await
                     {
-                        Ok(()) => info!("🔁 重发订阅成功：transactions + {n} 个账户"),
-                        Err(e) => error!("❌ 重发订阅失败（账户数 {n}）：{e} —— 订阅已停留在旧列表！"),
+                        Ok(()) => {
+                            sent_gen = gen;
+                            info!("🔁 重发订阅成功：transactions + {n} 个账户 (gen={gen})");
+                        }
+                        Err(e) => error!("❌ 重发订阅失败（账户数 {n}, gen={gen}）：{e} —— 下个 tick 重试"),
                     }
                 }
             }
