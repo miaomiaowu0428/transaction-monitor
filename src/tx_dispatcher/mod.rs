@@ -521,8 +521,8 @@ impl TxDispatcher {
                 // 重发失败时**不**更新 `sent_gen`，下个 tick 会自动重试。
                 // 注意必须带上 transactions，否则交易订阅会被清空。
                 _ = sub_tick.tick() => {
-                    let gen = self.inner.account_change_gen.load(Ordering::Relaxed);
-                    if gen == sent_gen {
+                    let cur_gen = self.inner.account_change_gen.load(Ordering::Relaxed);
+                    if cur_gen == sent_gen {
                         continue;
                     }
                     let updated_accounts = build_account_subs(&self.inner);
@@ -540,10 +540,10 @@ impl TxDispatcher {
                         .await
                     {
                         Ok(()) => {
-                            sent_gen = gen;
-                            info!("🔁 重发订阅成功：transactions + {n} 个账户 (gen={gen})");
+                            sent_gen = cur_gen;
+                            info!("🔁 重发订阅成功：transactions + {n} 个账户 (gen={cur_gen})");
                         }
-                        Err(e) => error!("❌ 重发订阅失败（账户数 {n}, gen={gen}）：{e} —— 下个 tick 重试"),
+                        Err(e) => error!("❌ 重发订阅失败（账户数 {n}, gen={cur_gen}）：{e} —— 下个 tick 重试"),
                     }
                 }
             }

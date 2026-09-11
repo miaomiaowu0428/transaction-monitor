@@ -149,10 +149,13 @@ impl TxDispatcherInner {
             }
         }
         // 通知 gRPC 流重新发送订阅请求
+        // 代际计数 +1 是**可靠**的信号（电平）；Notify 仅作为快速唤醒（边沿，会丢）
+        self.account_change_gen.fetch_add(1, Ordering::Relaxed);
         self.account_change_notify.notify_one();
     }
 
     pub(crate) fn notify_account_change(&self) {
+        self.account_change_gen.fetch_add(1, Ordering::Relaxed);
         self.account_change_notify.notify_one();
     }
 }
