@@ -16,15 +16,14 @@ solana-transaction-status-client-types = "3.1.8"
 solana-tx-parser = { git = "https://github.com/miaomiaowu0428/solana-tx-parser.git" }
 tokio = { version = "1.49.0", features = ["rt", "sync", "time"] }
 grpc-client = { git = "https://github.com/miaomiaowu0428/grpc-client.git" }
-anyhow = "1.0.100"
-env_logger = "0.11.8"
+# 日志统一走 utils::init_logger（flexi_logger 写在 utils 里）。
+# ⚠️ 别再往这儿加 env_logger —— 它会拉 `jiff`，而 jiff 的发布包引用了仓库根目录的
+# markdown（`include_str!("../../../../COMPARE.md")`），在 registry 布局下必然编译失败。
 flexi_logger = "0.31.8"
-base58 = "0.2.0"
 whirlwind = { git = "https://github.com/miaomiaowu0428/whirlwind.git" }
 transaction-cache = { git = "https://github.com/miaomiaowu0428/transaction-cache.git" }
 utils = { git = "https://github.com/miaomiaowu0428/sol-utils.git"  }
 rustls = "0.23.36"
-chrono = "0.4.43"
 yellowstone-grpc-proto = "10.1.1"
 async-trait = "0.1.89"
 arc-swap = "1.8.0"
