@@ -10,22 +10,24 @@ futures = "0.3.31"
 log = "0.4.29"
 serde = "1.0.228"
 serde_json = "1.0.149"
-solana-client = "3.1.8"
-solana-sdk = "3.0.0"
-solana-transaction-status-client-types = "3.1.8"
-solana-tx-parser = { git = "https://github.com/miaomiaowu0428/solana-tx-parser.git" }
+solana-client = "4.2.2"
+solana-sdk = "4.0.0"
+solana-transaction-status-client-types = "4.2.2"
+solana-tx-parser = { git = "https://github.com/miaomiaowu0428/solana-tx-parser.git", branch = "supportV1" }
 tokio = "1.49.0"
-grpc-client = { git = "https://github.com/miaomiaowu0428/grpc-client.git" }
+grpc-client = { git = "https://github.com/miaomiaowu0428/grpc-client.git", branch = "supportV1" }
 anyhow = "1.0.100"
 env_logger = "0.11.8"
 flexi_logger = "0.31.8"
 base58 = "0.2.0"
-whirlwind = { git = "https://github.com/miaomiaowu0428/whirlwind.git" }
-transaction-cache = { git = "https://github.com/miaomiaowu0428/transaction-cache.git" }
-utils = { git = "https://github.com/miaomiaowu0428/sol-utils.git"  }
+whirlwind = { git = "https://github.com/miaomiaowu0428/whirlwind.git", branch = "supportV1" }
+transaction-cache = { git = "https://github.com/miaomiaowu0428/transaction-cache.git", branch = "supportV1" }
+utils = { git = "https://github.com/miaomiaowu0428/sol-utils.git", branch = "supportV1" }
 rustls = "0.23.36"
 chrono = "0.4.43"
 yellowstone-grpc-proto = "10.1.1"
 async-trait = "0.1.89"
 arc-swap = "1.8.0"
 rand = "0.9.2"
+
+[workspace]
