@@ -287,7 +287,10 @@ impl TxDispatcher {
     /// 返回 `None` 的 subscriber 会被自动移除。
     pub async fn dispatch(&self, tx: Arc<TransactionFormat>) {
         let slot = tx.slot;
-        ARRIVAL_TIMES.insert(tx.signature, Instant::now()).await;
+        // solana 4.x：`TransactionFormat` 不再直接暴露 `signature`，
+        // 从交易签名列表取第一条（即 fee payer 的签名，也是链上标识这笔交易的 sig）。
+        let sig = tx.transaction.signatures.first().copied().unwrap_or_default();
+        ARRIVAL_TIMES.insert(sig, Instant::now()).await;
         // GC：清理 10 slot 之前的旧记录
         let prev = MAX_ARRIVAL_SLOT.fetch_max(slot, Ordering::Relaxed);
         if slot > prev && prev > 0 && slot - prev >= 5 {
@@ -418,6 +421,9 @@ impl TxDispatcher {
             account_include,
             account_exclude: vec![],
             account_required: vec![],
+            // yellowstone-grpc-proto 12.x 新增字段，不使用。
+            cuckoo_account_include: None,
+            token_accounts: None,
         };
 
         // ── ④ 构建账户订阅过滤器（AccountSubs / WatchCreator 的数据来源）─────
@@ -444,6 +450,8 @@ impl TxDispatcher {
                         owner: vec![],
                         filters: vec![],
                         nonempty_txn_signature: None,
+                        // yellowstone-grpc-proto 12.x 新增字段，不使用。
+                        cuckoo_accounts_filter: None,
                     },
                 )])
             }
