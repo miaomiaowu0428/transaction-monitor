@@ -509,10 +509,14 @@ impl TxDispatcher {
                                     .await;
                             }
                             // A3. 账户更新：交给 AccountSubs 触发回调 (WatchCreator 等)
+                            //     `info.lamports` 一并存进缓存（`get_lamports()` 的读口，
+                            //     给 dash `CheckBalanceDrop` 哨兵当链下缓存用）。
                             Some(UpdateOneof::Account(acct)) => {
                                 if let Some(info) = acct.account {
                                     if let Ok(addr) = Pubkey::try_from(info.pubkey) {
-                                        self.inner.account_subs.update_and_fire(&addr, info.data, 0);
+                                        self.inner
+                                            .account_subs
+                                            .update_and_fire(&addr, info.data, info.lamports, 0);
                                     }
                                 }
                             }

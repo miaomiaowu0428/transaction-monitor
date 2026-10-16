@@ -98,6 +98,12 @@ impl Drop for AccountHandle {
 struct AddrState {
     callbacks: HashMap<u64, Box<dyn Fn(&Pubkey, &[u8], u64) + Send + Sync + 'static>>,
     latest: Option<(Vec<u8>, u64)>,
+    /// 最近一次更新的**原生 lamports**（SOL 余额）。
+    ///
+    /// 与 `latest` **同源、同一次更新**：gRPC 的 `SubscribeUpdateAccountInfo.lamports`
+    /// 或初值拉取时 `Account.lamports` —— 两者都在同一条写入路径上，
+    /// 不会出现「data 是新的、lamports 是旧的」这种错配。
+    latest_lamports: Option<u64>,
     bare_sub_count: u64,
 }
 
@@ -122,10 +128,11 @@ impl AccountSubs {
             .collect()
     }
 
-    pub fn update_and_fire(&self, addr: &Pubkey, data: Vec<u8>, slot: u64) {
+    pub fn update_and_fire(&self, addr: &Pubkey, data: Vec<u8>, lamports: u64, slot: u64) {
         let mut states = self.states.lock().unwrap();
         if let Some(s) = states.get_mut(addr) {
             s.latest = Some((data.clone(), slot));
+            s.latest_lamports = Some(lamports);
             for cb in s.callbacks.values() {
                 cb(addr, &data, slot);
             }
@@ -140,11 +147,16 @@ impl AccountSubs {
             .and_then(|s| s.latest.clone())
     }
 
+    /// 最近一次更新的**原生 lamports**；没订阅过 / 还没任何数据时为 `None`。
+    pub fn get_latest_lamports(&self, addr: &Pubkey) -> Option<u64> {
+        self.states.lock().unwrap().get(addr).and_then(|s| s.latest_lamports)
+    }
+
     /// 只在**缓存为空**时写入并触发回调，返回是否写入。
     ///
     /// 用于 RPC 初值拉取：它是异步的，期间可能已经有 gRPC 推送到达，
     /// 此时不能拿旧快照覆盖新数据。
-    pub fn update_if_empty(&self, addr: &Pubkey, data: Vec<u8>, slot: u64) -> bool {
+    pub fn update_if_empty(&self, addr: &Pubkey, data: Vec<u8>, lamports: u64, slot: u64) -> bool {
         let mut states = self.states.lock().unwrap();
         let Some(s) = states.get_mut(addr) else {
             return false;
@@ -153,6 +165,7 @@ impl AccountSubs {
             return false;
         }
         s.latest = Some((data.clone(), slot));
+        s.latest_lamports = Some(lamports);
         for cb in s.callbacks.values() {
             cb(addr, &data, slot);
         }
@@ -206,6 +219,21 @@ impl crate::tx_dispatcher::TxDispatcher {
         let (data, _) = subs.get_latest(addr)?;
         if_match(&data)
     }
+
+    /// 从缓存读取最近一次推送的账户**原生 lamports（SOL 余额）**。
+    ///
+    /// # 谁会用到
+    ///
+    /// `dash` 程序的 `CheckBalanceDrop`（tag 11）哨兵：买入交易里要填一串
+    /// 「链下缓存的余额」，这里就是那个缓存的读口 —— **纯内存、不打 RPC**。
+    ///
+    /// # 返回 `None` 的两种情况（调用方自己决定怎么兜底）
+    ///
+    /// 1. 这个地址**从没订阅过**（没调过 [`Self::subscribe_account`] / [`Self::on_account_update`]）；
+    /// 2. 订阅了但**初值还没拉回来**、gRPC 也没推送过（`prime_account` 是异步的）。
+    pub fn get_lamports(&self, addr: &Pubkey) -> Option<u64> {
+        self.inner.account_subs.get_latest_lamports(addr)
+    }
 }
 
 // ── TxDispatcherInner 内部 ───────────────────────────────────────────────
@@ -238,7 +266,7 @@ impl TxDispatcherInner {
             match tokio::time::timeout(PRIME_TIMEOUT, rpc.get_account(&addr)).await {
                 Ok(Ok(acct)) => {
                     let len = acct.data.len();
-                    if inner.account_subs.update_if_empty(&addr, acct.data, 0) {
+                    if inner.account_subs.update_if_empty(&addr, acct.data, acct.lamports, 0) {
                         log::debug!("📥 账户 {addr} 初值已拉取（{len}B）");
                     }
                 }
