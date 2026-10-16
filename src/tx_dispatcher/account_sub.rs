@@ -104,7 +104,34 @@ struct AddrState {
     /// 或初值拉取时 `Account.lamports` —— 两者都在同一条写入路径上，
     /// 不会出现「data 是新的、lamports 是旧的」这种错配。
     latest_lamports: Option<u64>,
+    /// 写入 [`Self::latest_lamports`] 时的 slot（`0` = 未知）。
+    ///
+    /// **两路数据源共用一个缓存**时靠它做单调保护，见 [`AddrState::apply_lamports`]：
+    /// 1. **账户流**：gRPC `SubscribeUpdateAccount`（改动即推，带 `slot`）；
+    /// 2. **交易流**：订阅器解析 `balance_changes_of_grpc` 的 `after_balance`
+    ///    （[`super::TxDispatcher::set_lamports`]，带交易 `slot`）。
+    ///
+    /// 两条流都是 Processed，但**跨通道到达顺序不保证** —— 没有这个 slot，一次迟到的
+    /// 旧帧就能把缓存**回退**成一个更旧（通常更高）的余额，让 `CheckBalanceDrop`
+    /// 误判成「掉太多」。
+    lamports_slot: u64,
     bare_sub_count: u64,
+}
+
+impl AddrState {
+    /// 写入 lamports，带 **slot 单调保护**。
+    ///
+    /// - `slot != 0` 且已存 slot 更大 → **丢弃**（迟到的旧帧不回退缓存）；
+    /// - `slot == 0`（初值 RPC 不知道 slot）→ 不做比较，直接写。
+    fn apply_lamports(&mut self, lamports: u64, slot: u64) {
+        if slot != 0 && self.lamports_slot != 0 && slot < self.lamports_slot {
+            return;
+        }
+        self.latest_lamports = Some(lamports);
+        if slot != 0 {
+            self.lamports_slot = slot;
+        }
+    }
 }
 
 pub(crate) struct AccountSubs {
@@ -132,10 +159,24 @@ impl AccountSubs {
         let mut states = self.states.lock().unwrap();
         if let Some(s) = states.get_mut(addr) {
             s.latest = Some((data.clone(), slot));
-            s.latest_lamports = Some(lamports);
+            s.apply_lamports(lamports, slot);
             for cb in s.callbacks.values() {
                 cb(addr, &data, slot);
             }
+        }
+    }
+
+    /// **只写 lamports**（不动 data、不触发回调），给交易流那条保底通道用。
+    ///
+    /// 返回是否写入（地址没订阅过 = `false`，调用方无副作用）。
+    pub fn set_lamports(&self, addr: &Pubkey, lamports: u64, slot: u64) -> bool {
+        let mut states = self.states.lock().unwrap();
+        match states.get_mut(addr) {
+            Some(s) => {
+                s.apply_lamports(lamports, slot);
+                true
+            }
+            None => false,
         }
     }
 
@@ -165,7 +206,7 @@ impl AccountSubs {
             return false;
         }
         s.latest = Some((data.clone(), slot));
-        s.latest_lamports = Some(lamports);
+        s.apply_lamports(lamports, slot);
         for cb in s.callbacks.values() {
             cb(addr, &data, slot);
         }
@@ -233,6 +274,24 @@ impl crate::tx_dispatcher::TxDispatcher {
     /// 2. 订阅了但**初值还没拉回来**、gRPC 也没推送过（`prime_account` 是异步的）。
     pub fn get_lamports(&self, addr: &Pubkey) -> Option<u64> {
         self.inner.account_subs.get_latest_lamports(addr)
+    }
+
+    /// **从交易流写入 lamports**（第二路数据源，只写余额、不动账户 data、不触发回调）。
+    ///
+    /// # 为什么要这条路
+    ///
+    /// 账户订阅只在**节点把账户写进去**时推一帧；它是主路。但生产上总会遇到
+    /// 「推送没到 / 连接刚重连」这类情况 —— 而交易流我们本来就在逐笔收，交易里
+    /// `post_balances` 就是**同一份权威数据**（`utils::balance_change::balance_changes_of_grpc`）。
+    /// 两条路写**同一个缓存**，靠 slot 单调保护合并（见 `AddrState::apply_lamports`），
+    /// 谁更新用谁，迟到帧不回退。
+    ///
+    /// - `addr` **必须是已订阅地址**（订阅过才有 `AddrState`）；没订阅过返回 `false`。
+    /// - `slot` 传该笔交易的 slot（合并用）；`0` = 未知，直接写不比较。
+    ///
+    /// 返回是否真的写入了缓存。
+    pub fn set_lamports(&self, addr: &Pubkey, lamports: u64, slot: u64) -> bool {
+        self.inner.account_subs.set_lamports(addr, lamports, slot)
     }
 }
 
@@ -307,5 +366,64 @@ impl TxDispatcherInner {
     pub(crate) fn notify_account_change(&self) {
         self.account_change_gen.fetch_add(1, Ordering::Relaxed);
         self.account_change_notify.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **跨通道合并的核心不变量**：迟到的旧帧不能把缓存回退成更旧的（通常更高的）余额。
+    ///
+    /// 两路数据源（gRPC 账户流 / 交易流）都是 Processed，但到达顺序不保证 ——
+    /// 一旦回退，`CheckBalanceDrop` 就会把「没掉」判成「掉太多」而误杀买单。
+    #[test]
+    fn lamports_never_regress_on_a_late_frame() {
+        let mut s = AddrState::default();
+
+        s.apply_lamports(100, 10);
+        assert_eq!(s.latest_lamports, Some(100));
+
+        // 迟到的旧帧：slot 更小、值更高（典型场景：对手刚掉完，旧值晚到）
+        s.apply_lamports(500, 9);
+        assert_eq!(s.latest_lamports, Some(100), "旧 slot 的帧必须被丢弃");
+
+        // 更新的帧照常写（对手又掉了）
+        s.apply_lamports(50, 11);
+        assert_eq!(s.latest_lamports, Some(50));
+
+        // slot = 0（初值 RPC，不知道 slot）：不做比较，直接写
+        s.apply_lamports(7, 0);
+        assert_eq!(s.latest_lamports, Some(7));
+    }
+
+    /// 只写 lamports 的通道**不动 data、不触发回调**（交易流那条保底路）。
+    #[test]
+    fn set_lamports_does_not_touch_data_or_callbacks() {
+        let subs = AccountSubs::new();
+        let addr = Pubkey::new_unique();
+        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // 注册一个带回调的订阅，先灌一帧 data
+        {
+            let fired = Arc::clone(&fired);
+            let mut states = subs.states.lock().unwrap();
+            let st = states.entry(addr).or_default();
+            st.callbacks
+                .insert(1, Box::new(move |_, _, _| {
+                    fired.fetch_add(1, Ordering::SeqCst);
+                }));
+        }
+        subs.update_and_fire(&addr, vec![1, 2, 3], 100, 10);
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+
+        // 交易流只写余额
+        assert!(subs.set_lamports(&addr, 55, 11));
+        assert_eq!(subs.get_latest_lamports(&addr), Some(55));
+        assert_eq!(subs.get_latest(&addr).map(|(d, _)| d), Some(vec![1, 2, 3]), "data 不能被覆盖");
+        assert_eq!(fired.load(Ordering::SeqCst), 1, "只写余额不该触发回调");
+
+        // 没订阅过的地址：写不进去，返回 false
+        assert!(!subs.set_lamports(&Pubkey::new_unique(), 1, 1));
     }
 }
