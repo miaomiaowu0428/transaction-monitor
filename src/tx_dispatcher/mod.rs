@@ -511,15 +511,25 @@ impl TxDispatcher {
                             // A3. 账户更新：交给 AccountSubs 触发回调 (WatchCreator 等)
                             //     `info.lamports` 一并存进缓存（`get_lamports()` 的读口，
                             //     给 dash `CheckBalanceDrop` 哨兵当链下缓存用）；
-                            //     `acct.slot` 一起带上 —— 缓存里两路数据源（账户流 / 交易流）
-                            //     靠它做 slot 单调合并，迟到帧不回退（见 account_sub 的 AddrState）。
+                            //     `acct.slot` + `info.txn_signature` 一起带上 ——
+                            //     缓存里两路数据源（账户流 / 交易流）靠 slot 单调合并，
+                            //     签名只进诊断元数据（查询时才打日志，见 LamportsMeta）。
                             Some(UpdateOneof::Account(acct)) => {
                                 let slot = acct.slot;
                                 if let Some(info) = acct.account {
+                                    let txn_signature = info
+                                        .txn_signature
+                                        .as_deref()
+                                        .and_then(|b| <[u8; 64]>::try_from(b).ok())
+                                        .map(Signature::from);
                                     if let Ok(addr) = Pubkey::try_from(info.pubkey) {
-                                        self.inner
-                                            .account_subs
-                                            .update_and_fire(&addr, info.data, info.lamports, slot);
+                                        self.inner.account_subs.update_and_fire(
+                                            &addr,
+                                            info.data,
+                                            info.lamports,
+                                            slot,
+                                            txn_signature,
+                                        );
                                     }
                                 }
                             }

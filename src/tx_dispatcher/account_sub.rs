@@ -12,10 +12,11 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
+use solana_sdk::signature::Signature;
 
 use super::TxDispatcherInner;
 
@@ -94,6 +95,44 @@ impl Drop for AccountHandle {
 
 // ── 内部状态 ─────────────────────────────────────────────────────────────
 
+/// lamports 缓存是**哪一路**写进来的（**只用于查询时打日志**，不参与任何判定）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LamportsSource {
+    /// 订阅时的 RPC 初值拉取（`prime_account`）—— 不知道 slot、也没有交易签名
+    PrimeRpc,
+    /// gRPC 账户推送（`SubscribeUpdateAccount`）
+    AccountUpdate,
+    /// 交易流解析 `balance_changes_of_grpc`（保底通道，见 `TxDispatcher::set_lamports`）
+    Transaction,
+}
+
+impl LamportsSource {
+    /// 日志里用的短名
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PrimeRpc => "prime-rpc",
+            Self::AccountUpdate => "account",
+            Self::Transaction => "tx",
+        }
+    }
+}
+
+/// 一笔 lamports 缓存的**来源信息**：什么时候采到的、哪一路、链上 slot、交易签名。
+///
+/// 之所以要把这些留下来：`CheckBalanceDrop` 的语义完全取决于「这个读数有多新」，
+/// 出问题时必须能回答「这一笔买入用的余额是什么时候、从哪拿的、对应哪笔交易」。
+/// 采集时不打日志（热路径 + 刷屏），**查询时由调用方打**。
+#[derive(Clone, Debug)]
+pub struct LamportsMeta {
+    /// 写入缓存的**本地墙钟时刻**（不是链上时间）—— 用来算「这个读数有多旧」
+    pub observed_at: SystemTime,
+    /// 链上 slot（`0` = 未知，初值 RPC 就是这种）
+    pub slot: u64,
+    pub source: LamportsSource,
+    /// 产生这次变化的交易签名：交易流一定有；账户推送若带 `txn_signature` 也有
+    pub signature: Option<Signature>,
+}
+
 #[derive(Default)]
 struct AddrState {
     callbacks: HashMap<u64, Box<dyn Fn(&Pubkey, &[u8], u64) + Send + Sync + 'static>>,
@@ -115,6 +154,8 @@ struct AddrState {
     /// 旧帧就能把缓存**回退**成一个更旧（通常更高）的余额，让 `CheckBalanceDrop`
     /// 误判成「掉太多」。
     lamports_slot: u64,
+    /// [`Self::latest_lamports`] 的来源信息（诊断用，见 [`LamportsMeta`]）。
+    lamports_meta: Option<LamportsMeta>,
     bare_sub_count: u64,
 }
 
@@ -123,7 +164,7 @@ impl AddrState {
     ///
     /// - `slot != 0` 且已存 slot 更大 → **丢弃**（迟到的旧帧不回退缓存）；
     /// - `slot == 0`（初值 RPC 不知道 slot）→ 不做比较，直接写。
-    fn apply_lamports(&mut self, lamports: u64, slot: u64) {
+    fn apply_lamports(&mut self, lamports: u64, slot: u64, source: LamportsSource, signature: Option<Signature>) {
         if slot != 0 && self.lamports_slot != 0 && slot < self.lamports_slot {
             return;
         }
@@ -131,6 +172,12 @@ impl AddrState {
         if slot != 0 {
             self.lamports_slot = slot;
         }
+        self.lamports_meta = Some(LamportsMeta {
+            observed_at: SystemTime::now(),
+            slot,
+            source,
+            signature,
+        });
     }
 }
 
@@ -155,11 +202,11 @@ impl AccountSubs {
             .collect()
     }
 
-    pub fn update_and_fire(&self, addr: &Pubkey, data: Vec<u8>, lamports: u64, slot: u64) {
+    pub fn update_and_fire(&self, addr: &Pubkey, data: Vec<u8>, lamports: u64, slot: u64, txn_signature: Option<Signature>) {
         let mut states = self.states.lock().unwrap();
         if let Some(s) = states.get_mut(addr) {
             s.latest = Some((data.clone(), slot));
-            s.apply_lamports(lamports, slot);
+            s.apply_lamports(lamports, slot, LamportsSource::AccountUpdate, txn_signature);
             for cb in s.callbacks.values() {
                 cb(addr, &data, slot);
             }
@@ -169,11 +216,11 @@ impl AccountSubs {
     /// **只写 lamports**（不动 data、不触发回调），给交易流那条保底通道用。
     ///
     /// 返回是否写入（地址没订阅过 = `false`，调用方无副作用）。
-    pub fn set_lamports(&self, addr: &Pubkey, lamports: u64, slot: u64) -> bool {
+    pub fn set_lamports(&self, addr: &Pubkey, lamports: u64, slot: u64, signature: Option<Signature>) -> bool {
         let mut states = self.states.lock().unwrap();
         match states.get_mut(addr) {
             Some(s) => {
-                s.apply_lamports(lamports, slot);
+                s.apply_lamports(lamports, slot, LamportsSource::Transaction, signature);
                 true
             }
             None => false,
@@ -193,6 +240,15 @@ impl AccountSubs {
         self.states.lock().unwrap().get(addr).and_then(|s| s.latest_lamports)
     }
 
+    /// 上面那个余额的**来源信息**（采集时刻 / 哪一路 / slot / 交易签名），给查询方打日志用。
+    pub fn get_latest_lamports_meta(&self, addr: &Pubkey) -> Option<LamportsMeta> {
+        self.states
+            .lock()
+            .unwrap()
+            .get(addr)
+            .and_then(|s| s.lamports_meta.clone())
+    }
+
     /// 只在**缓存为空**时写入并触发回调，返回是否写入。
     ///
     /// 用于 RPC 初值拉取：它是异步的，期间可能已经有 gRPC 推送到达，
@@ -206,7 +262,7 @@ impl AccountSubs {
             return false;
         }
         s.latest = Some((data.clone(), slot));
-        s.apply_lamports(lamports, slot);
+        s.apply_lamports(lamports, slot, LamportsSource::PrimeRpc, None);
         for cb in s.callbacks.values() {
             cb(addr, &data, slot);
         }
@@ -276,6 +332,14 @@ impl crate::tx_dispatcher::TxDispatcher {
         self.inner.account_subs.get_latest_lamports(addr)
     }
 
+    /// 上面那个余额的**来源信息**（采集时刻 / 哪一路 / slot / 交易签名）。
+    ///
+    /// 专门给「查询时打一条日志」用 —— 采集侧（账户推送、交易流）**不打日志**
+    /// （热路径 + 会刷屏），出问题时在这里一次问清楚。
+    pub fn get_lamports_meta(&self, addr: &Pubkey) -> Option<LamportsMeta> {
+        self.inner.account_subs.get_latest_lamports_meta(addr)
+    }
+
     /// **从交易流写入 lamports**（第二路数据源，只写余额、不动账户 data、不触发回调）。
     ///
     /// # 为什么要这条路
@@ -288,10 +352,11 @@ impl crate::tx_dispatcher::TxDispatcher {
     ///
     /// - `addr` **必须是已订阅地址**（订阅过才有 `AddrState`）；没订阅过返回 `false`。
     /// - `slot` 传该笔交易的 slot（合并用）；`0` = 未知，直接写不比较。
+    /// - `signature` 传该笔交易的签名（只进诊断元数据，不参与判定）。
     ///
     /// 返回是否真的写入了缓存。
-    pub fn set_lamports(&self, addr: &Pubkey, lamports: u64, slot: u64) -> bool {
-        self.inner.account_subs.set_lamports(addr, lamports, slot)
+    pub fn set_lamports(&self, addr: &Pubkey, lamports: u64, slot: u64, signature: Option<Signature>) -> bool {
+        self.inner.account_subs.set_lamports(addr, lamports, slot, signature)
     }
 }
 
@@ -381,20 +446,48 @@ mod tests {
     fn lamports_never_regress_on_a_late_frame() {
         let mut s = AddrState::default();
 
-        s.apply_lamports(100, 10);
+        s.apply_lamports(100, 10, LamportsSource::AccountUpdate, None);
         assert_eq!(s.latest_lamports, Some(100));
 
         // 迟到的旧帧：slot 更小、值更高（典型场景：对手刚掉完，旧值晚到）
-        s.apply_lamports(500, 9);
+        s.apply_lamports(500, 9, LamportsSource::Transaction, None);
         assert_eq!(s.latest_lamports, Some(100), "旧 slot 的帧必须被丢弃");
 
         // 更新的帧照常写（对手又掉了）
-        s.apply_lamports(50, 11);
+        s.apply_lamports(50, 11, LamportsSource::Transaction, None);
         assert_eq!(s.latest_lamports, Some(50));
 
         // slot = 0（初值 RPC，不知道 slot）：不做比较，直接写
-        s.apply_lamports(7, 0);
+        s.apply_lamports(7, 0, LamportsSource::PrimeRpc, None);
         assert_eq!(s.latest_lamports, Some(7));
+    }
+
+    /// 采集元数据要跟着余额一起更新：来源 / slot / 签名 / 采集时刻。
+    /// 查询侧（`get_lamports_meta`）就靠它打「这个读数哪来的、多旧」。
+    #[test]
+    fn lamports_meta_tracks_source_slot_and_signature() {
+        let subs = AccountSubs::new();
+        let addr = Pubkey::new_unique();
+        {
+            let mut states = subs.states.lock().unwrap();
+            states.entry(addr).or_default();
+        }
+
+        // 交易流写入：带 slot + 签名
+        let sig = Signature::from([7u8; 64]);
+        assert!(subs.set_lamports(&addr, 12_000_000_000, 351_234_567, Some(sig)));
+        let meta = subs.get_latest_lamports_meta(&addr).expect("meta 必须写进去了");
+        assert_eq!(meta.source, LamportsSource::Transaction);
+        assert_eq!(meta.slot, 351_234_567);
+        assert_eq!(meta.signature, Some(sig));
+        assert_eq!(meta.source.as_str(), "tx");
+
+        // 账户推送写入：来源要变成 account
+        subs.update_and_fire(&addr, vec![], 11_000_000_000, 351_234_570, None);
+        let meta = subs.get_latest_lamports_meta(&addr).unwrap();
+        assert_eq!(meta.source, LamportsSource::AccountUpdate);
+        assert_eq!(meta.slot, 351_234_570);
+        assert_eq!(meta.signature, None, "这帧没带 txn_signature");
     }
 
     /// 只写 lamports 的通道**不动 data、不触发回调**（交易流那条保底路）。
@@ -414,16 +507,16 @@ mod tests {
                     fired.fetch_add(1, Ordering::SeqCst);
                 }));
         }
-        subs.update_and_fire(&addr, vec![1, 2, 3], 100, 10);
+        subs.update_and_fire(&addr, vec![1, 2, 3], 100, 10, None);
         assert_eq!(fired.load(Ordering::SeqCst), 1);
 
         // 交易流只写余额
-        assert!(subs.set_lamports(&addr, 55, 11));
+        assert!(subs.set_lamports(&addr, 55, 11, None));
         assert_eq!(subs.get_latest_lamports(&addr), Some(55));
         assert_eq!(subs.get_latest(&addr).map(|(d, _)| d), Some(vec![1, 2, 3]), "data 不能被覆盖");
         assert_eq!(fired.load(Ordering::SeqCst), 1, "只写余额不该触发回调");
 
         // 没订阅过的地址：写不进去，返回 false
-        assert!(!subs.set_lamports(&Pubkey::new_unique(), 1, 1));
+        assert!(!subs.set_lamports(&Pubkey::new_unique(), 1, 1, None));
     }
 }
