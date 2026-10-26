@@ -33,8 +33,7 @@ use grpc_client::YellowstoneGrpc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use yellowstone_grpc_proto::geyser::{
-    CommitmentLevel, SubscribeRequest, SubscribeRequestFilterTransactions, SubscribeRequestPing,
-    subscribe_update::UpdateOneof,
+    CommitmentLevel, SubscribeRequest, SubscribeRequestFilterTransactions, SubscribeRequestPing, subscribe_update::UpdateOneof,
 };
 
 /// 不传账户时默认盯 pump.fun 程序（链上最忙的合约之一，样本量大）。
@@ -80,9 +79,9 @@ where
 
 /// 解析 `http://host:port` 并在 127.0.0.1 上起计数代理。
 async fn start_proxy(url: &str) -> Result<Proxy, String> {
-    let rest = url.strip_prefix("http://").ok_or_else(|| {
-        "探针只能拆 http:// 端点（https 的 TLS 无法在本地代理里拆；请换内网 http 端点）".to_string()
-    })?;
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or_else(|| "探针只能拆 http:// 端点（https 的 TLS 无法在本地代理里拆；请换内网 http 端点）".to_string())?;
     let authority = match rest.find("/") {
         Some(i) => &rest[..i],
         None => rest,
@@ -90,9 +89,7 @@ async fn start_proxy(url: &str) -> Result<Proxy, String> {
     let (host, port) = match authority.rfind(":") {
         Some(i) => (
             authority[..i].to_string(),
-            authority[i + 1..]
-                .parse::<u16>()
-                .map_err(|e| format!("端口解析失败: {e}"))?,
+            authority[i + 1..].parse::<u16>().map_err(|e| format!("端口解析失败: {e}"))?,
         ),
         None => (authority.to_string(), 80),
     };
@@ -137,8 +134,7 @@ async fn start_proxy(url: &str) -> Result<Proxy, String> {
 }
 
 async fn run_mode(mode: &str, secs: u64, accounts: &[String]) -> Result<Stats, String> {
-    let url = std::env::var("YELLOWSTONE_GRPC_URL")
-        .map_err(|_| "YELLOWSTONE_GRPC_URL 未设置（先 source .env）".to_string())?;
+    let url = std::env::var("YELLOWSTONE_GRPC_URL").map_err(|_| "YELLOWSTONE_GRPC_URL 未设置（先 source .env）".to_string())?;
     let token = std::env::var("YELLOWSTONE_GRPC_TOKEN").ok();
 
     let proxy = start_proxy(&url).await?;
@@ -146,10 +142,7 @@ async fn run_mode(mode: &str, secs: u64, accounts: &[String]) -> Result<Stats, S
 
     let grpc = YellowstoneGrpc::new(proxy.local_url.clone(), token);
     let grpc = if mode == "none" { grpc.no_compression() } else { grpc.gzip() };
-    let client = grpc
-        .build_client()
-        .await
-        .map_err(|e| format!("build_client 失败: {e:?}"))?;
+    let client = grpc.build_client().await.map_err(|e| format!("build_client 失败: {e:?}"))?;
 
     let filter = SubscribeRequestFilterTransactions {
         vote: Some(false),
@@ -251,6 +244,7 @@ fn print_stats(s: &Stats) {
 
 #[tokio::main]
 async fn main() {
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).unwrap();
     let _ = dotenvy::dotenv();
 
     let mut args = std::env::args().skip(1);
@@ -297,7 +291,10 @@ async fn main() {
     if results.len() == 2 {
         let (none, gzip) = (&results[0], &results[1]);
         if none.msgs == 0 || gzip.msgs == 0 {
-            println!("\n⚠️ 样本不足（msgs={}/{}），换个更忙的 account_include 或加长秒数再测", none.msgs, gzip.msgs);
+            println!(
+                "\n⚠️ 样本不足（msgs={}/{}），换个更忙的 account_include 或加长秒数再测",
+                none.msgs, gzip.msgs
+            );
         } else {
             let ratio = none.bytes_per_msg() / gzip.bytes_per_msg();
             println!(
