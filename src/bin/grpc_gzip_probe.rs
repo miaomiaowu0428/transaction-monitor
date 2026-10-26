@@ -1,9 +1,12 @@
 //! gRPC 订阅压缩诊断：对比 gzip / 明文下的实际下行字节数。
 //!
 //! 为什么需要它：`accept_compressed(gzip)` 只是**告知**服务端「我可以收 gzip」，
-//! 压不压由服务端（或中间代理）决定。这个 bin 用 `/proc/self/io` 的 `rchar`
-//! 统计同一过滤器、同样时长下两种模式各读了多少字节（TLS 密文口径），
-//! 直接看压没压。
+//! 压不压由服务端（或中间代理）决定。
+//!
+//! 统计方式：在本地起一个 TCP 代理（仅支持 `http://` 端点，TLS 拆不开），
+//! 客户端连 `127.0.0.1`，代理逐字节转发并计数，得到**真实 TCP payload 字节**。
+//! 不用 `/proc/self/io`：实测在容器/虚拟化环境里 `rchar` 根本不统计 socket，
+//! 会得到个位数字节的假数据。
 //!
 //! 用法（在仓库根目录、能连到 `YELLOWSTONE_GRPC_URL` 的机器上）：
 //!
@@ -21,60 +24,132 @@
 //! 开着也不会更省流量，但不会报错。
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
 use grpc_client::YellowstoneGrpc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use yellowstone_grpc_proto::geyser::{
-    CommitmentLevel, SubscribeRequest, SubscribeRequestFilterTransactions, SubscribeRequestPing, subscribe_update::UpdateOneof,
+    CommitmentLevel, SubscribeRequest, SubscribeRequestFilterTransactions, SubscribeRequestPing,
+    subscribe_update::UpdateOneof,
 };
 
 /// 不传账户时默认盯 pump.fun 程序（链上最忙的合约之一，样本量大）。
 const DEFAULT_ACCOUNT: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 
 struct Stats {
-    mode: &'static str,
+    mode: String,
     secs: f64,
     msgs: u64,
     pings: u64,
-    bytes: u64,
+    down: u64,
+    up: u64,
 }
 
 impl Stats {
     fn bytes_per_msg(&self) -> f64 {
-        self.bytes as f64 / self.msgs.max(1) as f64
+        self.down as f64 / self.msgs.max(1) as f64
     }
 }
 
-fn rchar() -> u64 {
-    let s = std::fs::read_to_string("/proc/self/io").unwrap_or_default();
-    for line in s.lines() {
-        if let Some(v) = line.strip_prefix("rchar: ") {
-            return v.trim().parse().unwrap_or(0);
+/// 本地计数代理：`local_url` 给客户端用，`down`/`up` 是累计字节。
+struct Proxy {
+    local_url: String,
+    down: Arc<AtomicU64>,
+    up: Arc<AtomicU64>,
+}
+
+async fn copy_count<R, W>(reader: &mut R, writer: &mut W, counter: &AtomicU64) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; 32 * 1024];
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(());
         }
+        writer.write_all(&buf[..n]).await?;
+        counter.fetch_add(n as u64, Ordering::Relaxed);
     }
-    0
 }
 
-fn with_commas(n: u64) -> String {
-    let s = n.to_string();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
-            out.push(',');
+/// 解析 `http://host:port` 并在 127.0.0.1 上起计数代理。
+async fn start_proxy(url: &str) -> Result<Proxy, String> {
+    let rest = url.strip_prefix("http://").ok_or_else(|| {
+        "探针只能拆 http:// 端点（https 的 TLS 无法在本地代理里拆；请换内网 http 端点）".to_string()
+    })?;
+    let authority = match rest.find("/") {
+        Some(i) => &rest[..i],
+        None => rest,
+    };
+    let (host, port) = match authority.rfind(":") {
+        Some(i) => (
+            authority[..i].to_string(),
+            authority[i + 1..]
+                .parse::<u16>()
+                .map_err(|e| format!("端口解析失败: {e}"))?,
+        ),
+        None => (authority.to_string(), 80),
+    };
+    let upstream = format!("{host}:{port}");
+
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .map_err(|e| format!("代理监听失败: {e}"))?;
+    let local_port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    let down = Arc::new(AtomicU64::new(0));
+    let up = Arc::new(AtomicU64::new(0));
+    let (down2, up2) = (down.clone(), up.clone());
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((inbound, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(upstream_conn) = TcpStream::connect(&upstream).await else {
+                continue;
+            };
+            let (client_r, client_w) = tokio::io::split(inbound);
+            let (server_r, server_w) = tokio::io::split(upstream_conn);
+            let up3 = up2.clone();
+            tokio::spawn(async move {
+                let (mut r, mut w) = (client_r, server_w);
+                let _ = copy_count(&mut r, &mut w, &up3).await;
+            });
+            let down3 = down2.clone();
+            tokio::spawn(async move {
+                let (mut r, mut w) = (server_r, client_w);
+                let _ = copy_count(&mut r, &mut w, &down3).await;
+            });
         }
-        out.push(c);
-    }
-    out
+    });
+
+    Ok(Proxy {
+        local_url: format!("http://127.0.0.1:{local_port}"),
+        down,
+        up,
+    })
 }
 
-async fn run_mode(mode: &'static str, secs: u64, accounts: &[String]) -> Result<Stats, String> {
-    let url = std::env::var("YELLOWSTONE_GRPC_URL").map_err(|_| "YELLOWSTONE_GRPC_URL 未设置（先 source .env）".to_string())?;
+async fn run_mode(mode: &str, secs: u64, accounts: &[String]) -> Result<Stats, String> {
+    let url = std::env::var("YELLOWSTONE_GRPC_URL")
+        .map_err(|_| "YELLOWSTONE_GRPC_URL 未设置（先 source .env）".to_string())?;
     let token = std::env::var("YELLOWSTONE_GRPC_TOKEN").ok();
 
-    let grpc = YellowstoneGrpc::new(url, token);
+    let proxy = start_proxy(&url).await?;
+    println!("  本地计数代理: {} -> {url}", proxy.local_url);
+
+    let grpc = YellowstoneGrpc::new(proxy.local_url.clone(), token);
     let grpc = if mode == "none" { grpc.no_compression() } else { grpc.gzip() };
-    let client = grpc.build_client().await.map_err(|e| format!("build_client 失败: {e:?}"))?;
+    let client = grpc
+        .build_client()
+        .await
+        .map_err(|e| format!("build_client 失败: {e:?}"))?;
 
     let filter = SubscribeRequestFilterTransactions {
         vote: Some(false),
@@ -99,7 +174,6 @@ async fn run_mode(mode: &'static str, secs: u64, accounts: &[String]) -> Result<
         .await
         .map_err(|e| format!("subscribe 失败: {e:?}"))?;
 
-    let before = rchar();
     let start = Instant::now();
     let deadline = start + Duration::from_secs(secs);
     let mut msgs = 0u64;
@@ -128,33 +202,55 @@ async fn run_mode(mode: &'static str, secs: u64, accounts: &[String]) -> Result<
             Err(_) => break,
         }
     }
-    let bytes = rchar().saturating_sub(before);
+    let secs_elapsed = start.elapsed().as_secs_f64();
+
+    // 断开连接，让代理把在途字节记完，再读计数。
+    drop(stream);
+    drop(tx);
+    drop(client);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let down = proxy.down.load(Ordering::Relaxed);
+    let up = proxy.up.load(Ordering::Relaxed);
     Ok(Stats {
-        mode,
-        secs: start.elapsed().as_secs_f64(),
+        mode: mode.to_string(),
+        secs: secs_elapsed,
         msgs,
         pings,
-        bytes,
+        down,
+        up,
     })
 }
 
+fn with_commas(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push_str(",");
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn print_stats(s: &Stats) {
-    let bps = (s.bytes as f64 / s.secs.max(1e-9)) as u64;
+    let bps = (s.down as f64 / s.secs.max(1e-9)) as u64;
     println!(
-        "  {:<4} {:>5.1}s  msgs={:<6} pings={:<3} bytes={:>12}  B/s={:>10}  B/msg={:>8.1}",
+        "  {:<4} {:>5.1}s  msgs={:<6} pings={:<3} down={:>12}  down/s={:>10}  B/msg={:>9.1}  up={:>9}",
         s.mode,
         s.secs,
         s.msgs,
         s.pings,
-        with_commas(s.bytes),
+        with_commas(s.down),
         with_commas(bps),
-        s.bytes_per_msg()
+        s.bytes_per_msg(),
+        with_commas(s.up)
     );
 }
 
 #[tokio::main]
 async fn main() {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).unwrap();
     let _ = dotenvy::dotenv();
 
     let mut args = std::env::args().skip(1);
@@ -162,17 +258,17 @@ async fn main() {
     let mode = args.next().unwrap_or_else(|| "both".to_string());
     let accounts: Vec<String> = match args.next() {
         Some(a) => a
-            .split(',')
+            .split(",")
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .collect(),
         None => vec![DEFAULT_ACCOUNT.to_string()],
     };
-    let modes: Vec<&'static str> = match mode.as_str() {
-        "gzip" => vec!["gzip"],
-        "none" => vec!["none"],
-        "both" => vec!["none", "gzip"],
+    let modes: Vec<String> = match mode.as_str() {
+        "gzip" => vec!["gzip".to_string()],
+        "none" => vec!["none".to_string()],
+        "both" => vec!["none".to_string(), "gzip".to_string()],
         other => {
             eprintln!("未知模式 {other}，可选 gzip | none | both");
             std::process::exit(2);
@@ -186,7 +282,7 @@ async fn main() {
     let mut results: Vec<Stats> = Vec::new();
     for m in modes {
         println!("── 运行 {m} ...");
-        match run_mode(m, secs, &accounts).await {
+        match run_mode(&m, secs, &accounts).await {
             Ok(stats) => {
                 print_stats(&stats);
                 results.push(stats);
@@ -201,10 +297,7 @@ async fn main() {
     if results.len() == 2 {
         let (none, gzip) = (&results[0], &results[1]);
         if none.msgs == 0 || gzip.msgs == 0 {
-            println!(
-                "\n⚠️ 样本不足（msgs={}/{}），换个更忙的 account_include 或加长秒数再测",
-                none.msgs, gzip.msgs
-            );
+            println!("\n⚠️ 样本不足（msgs={}/{}），换个更忙的 account_include 或加长秒数再测", none.msgs, gzip.msgs);
         } else {
             let ratio = none.bytes_per_msg() / gzip.bytes_per_msg();
             println!(
@@ -222,3 +315,34 @@ async fn main() {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 本地代理必须原样转发并分别计数两个方向。
+    #[tokio::test]
+    async fn proxy_counts_both_directions() {
+        // 假上游：收 4 字节，回 100KB，然后关闭。
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4];
+            s.read_exact(&mut buf).await.unwrap();
+            s.write_all(&vec![7u8; 100_000]).await.unwrap();
+            s.shutdown().await.unwrap();
+        });
+
+        let proxy = start_proxy(&format!("http://127.0.0.1:{port}")).await.unwrap();
+        let addr = proxy.local_url.trim_start_matches("http://").to_string();
+        let mut c = TcpStream::connect(&addr).await.unwrap();
+        c.write_all(b"ping").await.unwrap();
+        let mut out = Vec::new();
+        c.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out.len(), 100_000);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(proxy.up.load(Ordering::Relaxed), 4, "upstream 方向计数");
+        assert_eq!(proxy.down.load(Ordering::Relaxed), 100_000, "downstream 方向计数");
+    }
+}
