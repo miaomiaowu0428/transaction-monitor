@@ -90,6 +90,29 @@ pub async fn arrival_time(sig: &Signature) -> Option<Instant> {
     ARRIVAL_TIMES.get(sig).await.map(|i| *i)
 }
 
+/// 订阅响应是否请求 gzip（服务端 → 客户端的下行压缩）。
+///
+/// 默认**开**；环境变量 `YELLOWSTONE_GRPC_COMPRESSION_ENCODING`：
+/// - 未设置 / 空 / `gzip` → 开
+/// - `none` / `identity` / `off` → 关（排障或服务端不兼容时退回明文）
+///
+/// 只影响接收方向。Yellowstone 服务端默认 `compression.send = [gzip, zstd]`，
+/// 只有客户端在握手时带了 `grpc-accept-encoding` 才会压；不支持的服务端会忽略
+/// 这个头、照样发明文，不会报错，所以默认开着是安全的。
+fn gzip_enabled() -> bool {
+    let Ok(raw) = std::env::var("YELLOWSTONE_GRPC_COMPRESSION_ENCODING") else {
+        return true;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "gzip" => true,
+        "none" | "identity" | "off" => false,
+        other => {
+            warn!("⚠️ 未知 YELLOWSTONE_GRPC_COMPRESSION_ENCODING={other}（仅支持 gzip / none），按 gzip 处理");
+            true
+        }
+    }
+}
+
 /// 交易分发器的内部实现，通过 [`Arc`] 共享给 [`SubscriberHandle`]。
 struct TxDispatcherInner {
     subscribers: ArcSwap<HashMap<u64, SubscriberEntry>>,
@@ -334,6 +357,7 @@ impl TxDispatcher {
     ///
     /// 使用指数退避（最大 60s）应对网络中断。
     /// gRPC URL 从环境变量 `YELLOWSTONE_GRPC_URL` 读取，token 从 `YELLOWSTONE_GRPC_TOKEN` 读取（可选）。
+    /// 订阅响应压缩默认 gzip，见 [`gzip_enabled`]。
     pub async fn run(&self) {
         // ── 读取连接配置 ─────────────────────────────────────────────────────
         let url = std::env::var("YELLOWSTONE_GRPC_URL").expect("YELLOWSTONE_GRPC_URL must be set");
@@ -343,6 +367,16 @@ impl TxDispatcher {
             info!("✅ 使用 Yellowstone token 认证: {}", &t[..8]);
         } else {
             warn!("⚠️ 未设置 YELLOWSTONE_GRPC_TOKEN，请确保您使用的节点无需认证");
+        }
+
+        // ── 订阅响应压缩（省下行流量）──────────────────────────────────────
+        // 交易/账户推送是大头；上行只有 SubscribeRequest / Ping，不值得压，
+        // 所以只开「服务端 → 客户端」方向（tonic 的 accept_compressed）。
+        let gzip = gzip_enabled();
+        if gzip {
+            info!("🗜️ gRPC 订阅响应压缩：gzip（YELLOWSTONE_GRPC_COMPRESSION_ENCODING=none 可关闭）");
+        } else {
+            info!("🗜️ gRPC 订阅响应压缩：已关闭（identity）");
         }
 
         // ── 重连退避参数 ─────────────────────────────────────────────────────
@@ -355,7 +389,7 @@ impl TxDispatcher {
         loop {
             info!("🔗 正在连接到 Yellowstone gRPC: {}", url);
 
-            match self.run_once(&url, token.as_deref()).await {
+            match self.run_once(&url, token.as_deref(), gzip).await {
                 Ok(_) => {
                     // gRPC 流正常结束（极少见，节点可能做了优雅关闭）
                     warn!("⚠️ gRPC 流正常结束，准备重连...");
@@ -380,12 +414,19 @@ impl TxDispatcher {
         &self,
         url: &str,
         token: Option<&str>,
+        gzip: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // ── ① 连接 gRPC 节点 ──────────────────────────────────────────────────
         // 建立与 Yellowstone gRPC 的长连接，使用 TLS 加密。
         // 如果节点要求 token 认证（通过 YELLOWSTONE_GRPC_TOKEN 环境变量传入），
         // 此处会一并带上。
-        let grpc = YellowstoneGrpc::new(url.to_string(), token.map(|s| s.to_string()));
+        //
+        // `gzip` 打开后只在握手时声明 `grpc-accept-encoding: gzip`，
+        // 是否真的压缩由服务端决定（见 `gzip_enabled`）。
+        let mut grpc = YellowstoneGrpc::new(url.to_string(), token.map(|s| s.to_string()));
+        if gzip {
+            grpc = grpc.gzip();
+        }
         let client = grpc
             .build_client()
             .await
