@@ -5,6 +5,7 @@
 
 use grpc_client::TransactionFormat;
 use std::sync::Arc;
+use utils::tx_ctx::TxCtx;
 
 /// 注册时缓存的 subscriber 元数据，dispatch 热路径避免虚函数调用。
 #[derive(Clone)]
@@ -31,6 +32,13 @@ pub trait TxSubscriber: Send + Sync + 'static {
     /// - None: 请求注销，dispatcher 会移除此 subscriber
     async fn interested(&self, tx: &TransactionFormat) -> Option<bool>;
 
-    /// 真正的处理逻辑
-    async fn on_tx(self: Arc<Self>, tx: Arc<TransactionFormat>);
+    /// 真正的处理逻辑。
+    ///
+    /// `ctx` 由 dispatcher **每笔交易只创建一次**，然后 `Arc` 分发给所有命中的
+    /// subscriber。需要指令时调 [`TxCtx::instructions`]：首次访问计算，之后共享，
+    /// 同一笔交易最多展平一次（改造前是每个 subscriber 各展平一遍）。
+    ///
+    /// 只要交易本体时可以直接用 `ctx.transaction` / `ctx.meta` / `ctx.slot`
+    /// （[`TxCtx`] 有 `Deref<Target = TransactionFormat>`）。
+    async fn on_tx(self: Arc<Self>, ctx: Arc<TxCtx>);
 }

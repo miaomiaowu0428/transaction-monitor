@@ -308,6 +308,10 @@ impl TxDispatcher {
     ///
     /// 每个 subscriber 在独立的 tokio 任务中并发运行 `interested` 和 `on_tx`。
     /// 返回 `None` 的 subscriber 会被自动移除。
+    ///
+    /// 交易以一个共享的 [`TxCtx`](utils::tx_ctx::TxCtx) 分发：指令序列由第一个
+    /// 需要它的 subscriber 展平一次，其余人复用（改造前每个 subscriber 各展平一遍）。
+    /// 指令是**懒展平**的 —— 没有任何 subscriber 命中时，连解析都不会发生。
     pub async fn dispatch(&self, tx: Arc<TransactionFormat>) {
         let slot = tx.slot;
         // solana 4.x：`TransactionFormat` 不再直接暴露 `signature`，
@@ -326,6 +330,10 @@ impl TxDispatcher {
         let subs = self.inner.subscribers.load();
         let is_failed = tx.meta.as_ref().map(|m| m.status.is_err()).unwrap_or(true);
 
+        // 一笔交易只建一个上下文：指令由第一个需要它的 subscriber 展平一次，
+        // 其余人共享同一个 Arc（改造前是每个 subscriber 各展平一遍）。
+        let ctx = Arc::new(utils::tx_ctx::TxCtx::new(tx));
+
         // 为每个 subscriber 独立 spawn 任务
         for (id, entry) in subs.iter() {
             // 失败交易：只有 accept_failed 的 subscriber 才处理
@@ -334,14 +342,14 @@ impl TxDispatcher {
             }
             let id = *id;
             let sub = entry.sub.clone();
-            let tx = tx.clone();
+            let ctx = ctx.clone();
             let dispatcher = self.inner.clone();
 
             tokio::spawn(async move {
-                match sub.interested(&tx).await {
+                match sub.interested(&ctx).await {
                     Some(true) => {
                         tokio::spawn(async move {
-                            sub.on_tx(tx).await;
+                            sub.on_tx(ctx).await;
                         });
                     }
                     Some(false) => {}
