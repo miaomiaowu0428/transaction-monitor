@@ -23,7 +23,6 @@
 //! 没开 compression.send（或中间层剥掉了 grpc-accept-encoding），此时客户端
 //! 开着也不会更省流量，但不会报错。
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -155,7 +154,8 @@ async fn run_mode(mode: &str, secs: u64, accounts: &[String]) -> Result<Stats, S
         token_accounts: None,
     };
     let req = SubscribeRequest {
-        transactions: HashMap::from([("probe".to_string(), filter)]),
+        // SubscribeRequest 的字段是 yellowstone_grpc_proto 里的 std HashMap
+        transactions: std::collections::HashMap::from([("probe".to_string(), filter)]),
         commitment: Some(CommitmentLevel::Processed.into()),
         ..Default::default()
     };

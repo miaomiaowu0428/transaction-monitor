@@ -18,7 +18,7 @@ use std::time::Instant;
 use solana_sdk::signature::Signature;
 use log::{error, info, warn};
 use solana_sdk::pubkey::Pubkey;
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use yellowstone_grpc_proto::geyser::{
     CommitmentLevel, SubscribeRequest, SubscribeRequestFilterTransactions, SubscribeRequestPing,
     subscribe_update::UpdateOneof,
@@ -130,7 +130,7 @@ struct TxDispatcherInner {
     /// 所以 gRPC 循环改成**电平触发**：定时比对代际计数，不等就重发。
     account_change_gen: AtomicU64,
     /// 已经主动拉过初值的账户（每个地址只拉一次）。
-    primed: std::sync::Mutex<std::collections::HashSet<Pubkey>>,
+    primed: std::sync::Mutex<hashbrown::HashSet<Pubkey>>,
     /// 限制初值拉取的并发度，避免一次订阅几百个账户时把 RPC 打爆。
     prime_sem: Arc<tokio::sync::Semaphore>,
 }
@@ -152,7 +152,7 @@ impl Default for TxDispatcher {
                 account_subs: AccountSubs::new(),
                 account_change_notify: tokio::sync::Notify::new(),
                 account_change_gen: AtomicU64::new(0),
-                primed: std::sync::Mutex::new(std::collections::HashSet::new()),
+                primed: std::sync::Mutex::new(hashbrown::HashSet::new()),
                 prime_sem: Arc::new(tokio::sync::Semaphore::new(account_sub::PRIME_CONCURRENCY)),
             }),
         }
@@ -479,6 +479,8 @@ impl TxDispatcher {
         // 闭包：从 account_subs 实时读取当前所有活跃的账户地址，
         // 构建 SubscribeRequestFilterAccounts。空则返回空 HashMap（不订阅任何账户）。
         // 每次 account_change_notify 触发时调用，确保只订阅当前需要的账户。
+        // 注意：SubscribeRequest 来自 yellowstone_grpc_proto，字段是 std HashMap，
+        // 这里必须用 std 版本，不能用 foldhash 的 hashbrown::HashMap。
         let build_account_subs = |inner: &TxDispatcherInner| -> std::collections::HashMap<
             String,
             yellowstone_grpc_proto::geyser::SubscribeRequestFilterAccounts,

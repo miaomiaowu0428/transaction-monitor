@@ -9,7 +9,7 @@
 //!
 //! [`prime_account`]: TxDispatcherInner::prime_account
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime};
